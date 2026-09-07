@@ -125,11 +125,24 @@ def resolve_tickers(watchlist_names):
 
 def fetch_equity_mids(tickers):
     mids = {}
+    ranges = {}
     for chunk in chunked(sorted(tickers), 100):
         resp = get("/market-data/by-type", equity=",".join(chunk))
         for item in resp["data"]["items"]:
             mids[item["symbol"]] = _mid(item)
-    return mids
+            year_low = item.get("year-low-price")
+            year_high = item.get("year-high-price")
+            if year_low is not None and year_high is not None:
+                ranges[item["symbol"]] = (float(year_low), float(year_high))
+    return mids, ranges
+
+
+def strike_position_in_52wk_range(strike, year_range):
+    """0.0 = strike at the 52-week low, 1.0 = strike at the 52-week high."""
+    year_low, year_high = year_range
+    if year_high == year_low:
+        return None
+    return (strike - year_low) / (year_high - year_low)
 
 
 def fetch_option_mids(symbols):
@@ -183,7 +196,7 @@ def pick_put_strike(expiration, underlying_mid):
     return otm[-1]
 
 
-def find_candidates(tickers, underlying_mids):
+def find_candidates(tickers, underlying_mids, underlying_ranges):
     candidates = []
     for ticker in sorted(tickers):
         underlying_mid = underlying_mids.get(ticker)
@@ -209,13 +222,19 @@ def find_candidates(tickers, underlying_mids):
         if strike is None:
             print(f"  {ticker}: no OTM put strike found, skipping", file=sys.stderr)
             continue
+        strike_price = float(strike["strike-price"])
+        year_range = underlying_ranges.get(ticker)
+        strike_52wk_position = (
+            strike_position_in_52wk_range(strike_price, year_range) if year_range else None
+        )
         candidates.append(
             {
                 "ticker": ticker,
                 "expiration": expiration["expiration-date"],
                 "dte": expiration["days-to-expiration"],
-                "strike": float(strike["strike-price"]),
+                "strike": strike_price,
                 "put_symbol": strike["put"],
+                "strike_52wk_position": strike_52wk_position,
             }
         )
     return candidates
@@ -263,6 +282,92 @@ def extract_marginal_buying_power(resp, ticker=None, debug=False):
     return None
 
 
+FIELDNAMES = [
+    "ticker",
+    "expiration",
+    "dte",
+    "strike",
+    "put_symbol",
+    "strike 52wk pct",
+    "credit",
+    "buying_power",
+    "credit to bpr",
+    "bpr to notional",
+]
+
+
+def write_csv(rows, out=sys.stdout):
+    writer = csv.DictWriter(out, fieldnames=FIELDNAMES)
+    writer.writeheader()
+    writer.writerows(rows)
+
+
+def write_html(rows, out=sys.stdout):
+    def cell(value):
+        return "" if value == "" else str(value)
+
+    header_cells = "".join(f"<th onclick=\"sortTable({i})\">{name}</th>" for i, name in enumerate(FIELDNAMES))
+    body_rows = "\n".join(
+        "<tr>" + "".join(f"<td>{cell(row[name])}</td>" for name in FIELDNAMES) + "</tr>" for row in rows
+    )
+
+    out.write(f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>scan-put-bp results</title>
+<style>
+  body {{ font-family: sans-serif; font-size: 14px; }}
+  table {{ border-collapse: collapse; }}
+  th, td {{ border: 1px solid #ccc; padding: 4px 8px; text-align: right; }}
+  th:first-child, td:first-child {{ text-align: left; }}
+  th {{ cursor: pointer; background: #eee; user-select: none; }}
+  th.asc::after {{ content: " \\25B2"; }}
+  th.desc::after {{ content: " \\25BC"; }}
+</style>
+</head>
+<body>
+<table id="results">
+<thead><tr>{header_cells}</tr></thead>
+<tbody>
+{body_rows}
+</tbody>
+</table>
+<script>
+let sortState = {{}};
+function sortTable(colIndex) {{
+  const table = document.getElementById("results");
+  const tbody = table.tBodies[0];
+  const rows = Array.from(tbody.rows);
+  const ascending = !sortState[colIndex];
+  sortState = {{}};
+  sortState[colIndex] = ascending;
+
+  rows.sort((a, b) => {{
+    const av = a.cells[colIndex].innerText;
+    const bv = b.cells[colIndex].innerText;
+    const an = parseFloat(av);
+    const bn = parseFloat(bv);
+    let cmp;
+    if (!isNaN(an) && !isNaN(bn)) {{
+      cmp = an - bn;
+    }} else {{
+      cmp = av.localeCompare(bv);
+    }}
+    return ascending ? cmp : -cmp;
+  }});
+
+  for (const row of rows) tbody.appendChild(row);
+
+  for (const th of table.tHead.rows[0].cells) th.classList.remove("asc", "desc");
+  table.tHead.rows[0].cells[colIndex].classList.add(ascending ? "asc" : "desc");
+}}
+</script>
+</body>
+</html>
+""")
+
+
 if __name__ == "__main__":
     positional_args = [a for a in sys.argv[1:] if not a.startswith("--")]
     config_path = positional_args[0] if positional_args else "margin-scan-config.json"
@@ -276,8 +381,8 @@ if __name__ == "__main__":
     tickers = filter_by_liquidity(tickers)
     print(f"{len(tickers)} tickers remain after liquidity filter: {sorted(tickers)}", file=sys.stderr)
 
-    underlying_mids = fetch_equity_mids(tickers)
-    candidates = find_candidates(tickers, underlying_mids)
+    underlying_mids, underlying_ranges = fetch_equity_mids(tickers)
+    candidates = find_candidates(tickers, underlying_mids, underlying_ranges)
 
     option_mids = fetch_option_mids([c["put_symbol"] for c in candidates])
 
@@ -313,28 +418,21 @@ if __name__ == "__main__":
                 "dte": c["dte"],
                 "strike": c["strike"],
                 "put_symbol": c["put_symbol"],
+                "strike 52wk pct": (
+                    round(c["strike_52wk_position"], 4)
+                    if c["strike_52wk_position"] is not None
+                    else ""
+                ),
                 "credit": round(credit, 2),
                 "buying_power": round(marginal_bp, 2),
-                "ratio": round(credit / marginal_bp, 4),
+                "credit to bpr": round(credit / marginal_bp, 4),
                 "bpr to notional": round(marginal_bp / notional, 4),
             }
         )
 
-    rows.sort(key=lambda r: r["ratio"], reverse=True)
+    rows.sort(key=lambda r: r["credit to bpr"], reverse=True)
 
-    writer = csv.DictWriter(
-        sys.stdout,
-        fieldnames=[
-            "ticker",
-            "expiration",
-            "dte",
-            "strike",
-            "put_symbol",
-            "credit",
-            "buying_power",
-            "ratio",
-            "bpr to notional",
-        ],
-    )
-    writer.writeheader()
-    writer.writerows(rows)
+    if "--html" in sys.argv:
+        write_html(rows)
+    else:
+        write_csv(rows)
