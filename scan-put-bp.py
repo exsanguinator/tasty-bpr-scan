@@ -293,6 +293,7 @@ FIELDNAMES = [
     "buying_power",
     "credit to bpr",
     "bpr to notional",
+    "credit to notional",
 ]
 
 
@@ -427,6 +428,7 @@ if __name__ == "__main__":
                 "buying_power": round(marginal_bp, 2),
                 "credit to bpr": round(credit / marginal_bp, 4),
                 "bpr to notional": round(marginal_bp / notional, 4),
+                "credit to notional": round(credit / notional, 4),
             }
         )
 
