@@ -294,18 +294,17 @@ def extract_marginal_buying_power(resp, ticker=None, debug=False):
 
 FIELDNAMES = [
     "ticker",
-    "ivr",
-    "ivx",
     "expiration",
     "dte",
     "strike",
-    "put_symbol",
     "strike 52wk pct",
     "credit",
     "buying_power",
     "credit to bpr",
     "bpr to notional",
     "credit to notional",
+    "ivr",
+    "ivx",
 ]
 
 
@@ -427,12 +426,11 @@ if __name__ == "__main__":
         rows.append(
             {
                 "ticker": c["ticker"],
-                "ivr": round(c["ivr"], 4) if c["ivr"] is not None else "",
-                "ivx": round(c["ivx"], 4) if c["ivx"] is not None else "",
+                "ivr": f"{c['ivr'] * 100:.2f}" if c["ivr"] is not None else "",
+                "ivx": f"{c['ivx'] * 100:.2f}" if c["ivx"] is not None else "",
                 "expiration": c["expiration"],
                 "dte": c["dte"],
                 "strike": c["strike"],
-                "put_symbol": c["put_symbol"],
                 "strike 52wk pct": (
                     round(c["strike_52wk_position"], 4)
                     if c["strike_52wk_position"] is not None
@@ -440,13 +438,13 @@ if __name__ == "__main__":
                 ),
                 "credit": round(credit, 2),
                 "buying_power": round(marginal_bp, 2),
-                "credit to bpr": round(credit / marginal_bp, 4),
-                "bpr to notional": round(marginal_bp / notional, 4),
-                "credit to notional": round(credit / notional, 4),
+                "credit to bpr": f"{credit / marginal_bp * 100:.2f}",
+                "bpr to notional": f"{marginal_bp / notional * 100:.2f}",
+                "credit to notional": f"{credit / notional * 100:.2f}",
             }
         )
 
-    rows.sort(key=lambda r: r["credit to bpr"], reverse=True)
+    rows.sort(key=lambda r: float(r["credit to bpr"]), reverse=True)
 
     if "--html" in sys.argv:
         write_html(rows)
