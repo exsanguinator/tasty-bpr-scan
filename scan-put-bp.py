@@ -160,12 +160,16 @@ MIN_LIQUIDITY_RATING = 2
 def filter_by_liquidity(tickers):
     kept = set()
     ivr_by_ticker = {}
+    ivx_by_ticker = {}
     for chunk in chunked(sorted(tickers), 100):
         resp = get("/market-metrics", symbols=",".join(chunk))
         for item in resp["data"]["items"]:
             ivr = item.get("implied-volatility-index-rank")
             if ivr is not None:
                 ivr_by_ticker[item["symbol"]] = float(ivr)
+            ivx = item.get("implied-volatility-index")
+            if ivx is not None:
+                ivx_by_ticker[item["symbol"]] = float(ivx)
             rating = item.get("liquidity-rating")
             if rating is not None and rating >= MIN_LIQUIDITY_RATING:
                 kept.add(item["symbol"])
@@ -174,7 +178,7 @@ def filter_by_liquidity(tickers):
                     f"  {item['symbol']}: liquidity-rating {rating} < {MIN_LIQUIDITY_RATING}, skipping",
                     file=sys.stderr,
                 )
-    return kept, ivr_by_ticker
+    return kept, ivr_by_ticker, ivx_by_ticker
 
 
 def _mid(item):
@@ -200,7 +204,7 @@ def pick_put_strike(expiration, underlying_mid):
     return otm[-1]
 
 
-def find_candidates(tickers, underlying_mids, underlying_ranges, ivr_by_ticker):
+def find_candidates(tickers, underlying_mids, underlying_ranges, ivr_by_ticker, ivx_by_ticker):
     candidates = []
     for ticker in sorted(tickers):
         underlying_mid = underlying_mids.get(ticker)
@@ -235,6 +239,7 @@ def find_candidates(tickers, underlying_mids, underlying_ranges, ivr_by_ticker):
             {
                 "ticker": ticker,
                 "ivr": ivr_by_ticker.get(ticker),
+                "ivx": ivx_by_ticker.get(ticker),
                 "expiration": expiration["expiration-date"],
                 "dte": expiration["days-to-expiration"],
                 "strike": strike_price,
@@ -290,6 +295,7 @@ def extract_marginal_buying_power(resp, ticker=None, debug=False):
 FIELDNAMES = [
     "ticker",
     "ivr",
+    "ivx",
     "expiration",
     "dte",
     "strike",
@@ -385,11 +391,11 @@ if __name__ == "__main__":
     tickers = resolve_tickers(watchlist_names)
     print(f"Resolved {len(tickers)} unique tickers: {sorted(tickers)}", file=sys.stderr)
 
-    tickers, ivr_by_ticker = filter_by_liquidity(tickers)
+    tickers, ivr_by_ticker, ivx_by_ticker = filter_by_liquidity(tickers)
     print(f"{len(tickers)} tickers remain after liquidity filter: {sorted(tickers)}", file=sys.stderr)
 
     underlying_mids, underlying_ranges = fetch_equity_mids(tickers)
-    candidates = find_candidates(tickers, underlying_mids, underlying_ranges, ivr_by_ticker)
+    candidates = find_candidates(tickers, underlying_mids, underlying_ranges, ivr_by_ticker, ivx_by_ticker)
 
     option_mids = fetch_option_mids([c["put_symbol"] for c in candidates])
 
@@ -422,6 +428,7 @@ if __name__ == "__main__":
             {
                 "ticker": c["ticker"],
                 "ivr": round(c["ivr"], 4) if c["ivr"] is not None else "",
+                "ivx": round(c["ivx"], 4) if c["ivx"] is not None else "",
                 "expiration": c["expiration"],
                 "dte": c["dte"],
                 "strike": c["strike"],
