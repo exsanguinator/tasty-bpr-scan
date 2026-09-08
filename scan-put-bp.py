@@ -426,21 +426,21 @@ if __name__ == "__main__":
         rows.append(
             {
                 "ticker": c["ticker"],
-                "ivr": f"{c['ivr'] * 100:.2f}" if c["ivr"] is not None else "",
-                "ivx": f"{c['ivx'] * 100:.2f}" if c["ivx"] is not None else "",
+                "ivr": f"{c['ivr'] * 100:.1f}" if c["ivr"] is not None else "",
+                "ivx": f"{c['ivx'] * 100:.1f}" if c["ivx"] is not None else "",
                 "expiration": c["expiration"],
                 "dte": c["dte"],
                 "strike": c["strike"],
                 "strike 52wk pct": (
-                    round(c["strike_52wk_position"], 4)
+                    f"{c['strike_52wk_position'] * 100:.1f}"
                     if c["strike_52wk_position"] is not None
                     else ""
                 ),
-                "credit": round(credit, 2),
-                "buying_power": round(marginal_bp, 2),
-                "credit to bpr": f"{credit / marginal_bp * 100:.2f}",
-                "bpr to notional": f"{marginal_bp / notional * 100:.2f}",
-                "credit to notional": f"{credit / notional * 100:.2f}",
+                "credit": f"{credit:.1f}",
+                "buying_power": f"{marginal_bp:.1f}",
+                "credit to bpr": f"{credit / marginal_bp * 100:.1f}",
+                "bpr to notional": f"{marginal_bp / notional * 100:.1f}",
+                "credit to notional": f"{credit / notional * 100:.1f}",
             }
         )
 
