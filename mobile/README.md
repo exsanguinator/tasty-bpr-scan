@@ -68,7 +68,7 @@ but that needs this Mac serving the bundle.
 | `lib/columns.ts` | Column definitions, formatters, numeric sort |
 | `lib/storage.ts` | AsyncStorage: settings and last scan result |
 | `lib/theme.ts` | Light/dark palettes, `ThemeProvider`, `useTheme()` |
-| `components/ResultsTable.tsx` | Sortable table, pinned ticker column |
+| `components/ResultsTable.tsx` | Sortable table, pinned ticker column and header row |
 | `screens/` | Results and Settings screens |
 | `scripts/scan-cli.ts` | Runs the scan under Node for verification |
 
@@ -78,6 +78,8 @@ but that needs this Mac serving the bundle.
   sequentially, and can be cancelled mid-scan.
 - Rows hold raw numbers and are formatted at render time, so table columns sort
   numerically rather than lexically.
+- `chg%` is colored green when positive and red when negative (zero and blanks keep the
+  default text color); the CSV from `scan-put-bp.py` is plain text.
 - Skipped tickers and their reasons appear in a collapsible "Skipped" section instead of
   going to stderr.
 - Settings (account, watchlists, theme) and the last result are persisted on-device; there is

@@ -29,6 +29,9 @@ export type Theme = {
   danger: string;
   /** Danger as a filled button background; pair with `onAccent`. */
   dangerBg: string;
+  /** Sign colors for signed numeric cells (chg%); zero stays the default text color. */
+  positive: string;
+  negative: string;
 };
 
 export const lightTheme: Theme = {
@@ -45,6 +48,8 @@ export const lightTheme: Theme = {
   onAccent: "#ffffff",
   danger: "#b91c1c",
   dangerBg: "#b91c1c",
+  positive: "#15803d",
+  negative: "#b91c1c",
 };
 
 // Accent and danger split into text vs. background variants: the light-theme blue is
@@ -64,6 +69,8 @@ export const darkTheme: Theme = {
   onAccent: "#ffffff",
   danger: "#ff9a90",
   dangerBg: "#c1372b",
+  positive: "#5fd894",
+  negative: "#ff9a90",
 };
 
 const ThemeContext = createContext<Theme>(lightTheme);

@@ -26,21 +26,35 @@ export type Column = {
   label: string;
   width: number;
   numeric: boolean;
+  /** Render the value green when positive, red when negative, plain at zero. */
+  signed?: boolean;
   format: (row: ScanRow) => string;
 };
 
+// Both formatters take undefined as well as null: a result cached by an older build
+// of the app has no field for a column added since, and renders blank rather than
+// crashing on the missing value.
 /** Matches the Python script's zero-padded 1-decimal formatting. */
-const oneDecimal = (value: number | null): string => (value === null ? "" : value.toFixed(1));
+const oneDecimal = (value: number | null | undefined): string =>
+  value == null ? "" : value.toFixed(1);
 
 /** chg% carries 2 decimals, matching the Python script. */
-const twoDecimal = (value: number | null): string => (value === null ? "" : value.toFixed(2));
+const twoDecimal = (value: number | null | undefined): string =>
+  value == null ? "" : value.toFixed(2);
 
 export const COLUMNS: Column[] = [
   { key: "expiration", label: "expiration", width: 92, numeric: false, format: (r) => r.expiration },
   { key: "dte", label: "dte", width: 46, numeric: true, format: (r) => String(r.dte) },
   { key: "strike", label: "strike", width: 66, numeric: true, format: (r) => String(r.strike) },
   { key: "strike52wkPct", label: "52wk %", width: 74, numeric: true, format: (r) => oneDecimal(r.strike52wkPct) },
-  { key: "chgPct", label: "chg%", width: 68, numeric: true, format: (r) => twoDecimal(r.chgPct) },
+  {
+    key: "chgPct",
+    label: "chg%",
+    width: 68,
+    numeric: true,
+    signed: true,
+    format: (r) => twoDecimal(r.chgPct),
+  },
   { key: "credit", label: "credit", width: 66, numeric: true, format: (r) => oneDecimal(r.credit) },
   { key: "buyingPower", label: "bpr", width: 78, numeric: true, format: (r) => oneDecimal(r.buyingPower) },
   { key: "creditToBpr", label: "cr/bpr", width: 72, numeric: true, format: (r) => oneDecimal(r.creditToBpr) },

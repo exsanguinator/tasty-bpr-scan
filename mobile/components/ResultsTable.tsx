@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useMemo, useRef, useState } from "react";
+import { Animated, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 import {
   COLUMNS,
@@ -54,6 +54,11 @@ export function ResultsTable({ rows }: { rows: ScanRow[] }) {
   const styles = useMemo(() => createStyles(theme), [theme]);
   const [sortKey, setSortKey] = useState<ColumnKey>(DEFAULT_SORT);
   const [ascending, setAscending] = useState(false);
+  // The header row sits outside the vertical scroller so it stays put, and it does
+  // not scroll horizontally on its own: it mirrors the body's offset, which keeps
+  // the two in step natively instead of syncing two scroll views on the JS thread.
+  const scrollX = useRef(new Animated.Value(0)).current;
+  const headerOffset = useMemo(() => Animated.multiply(scrollX, -1), [scrollX]);
 
   const sorted = useMemo(() => sortRows(rows, sortKey, ascending), [rows, sortKey, ascending]);
 
@@ -69,32 +74,16 @@ export function ResultsTable({ rows }: { rows: ScanRow[] }) {
   };
 
   return (
-    <View style={styles.container}>
-      {/* Pinned ticker column: 11 more columns will not fit a phone, so the rest scroll. */}
-      <View>
+    <View style={styles.table}>
+      <View style={styles.headerRow}>
         <HeaderCell
           column={TICKER_COLUMN}
           sortKey={sortKey}
           ascending={ascending}
           onPress={handleSort}
         />
-        {sorted.map((item, index) => (
-          <View
-            key={item.putSymbol}
-            style={[styles.row, index % 2 === 1 && styles.stripe]}
-          >
-            <View style={[styles.cell, { width: TICKER_COLUMN.width }]}>
-              <Text numberOfLines={1} style={styles.tickerText}>
-                {item.ticker}
-              </Text>
-            </View>
-          </View>
-        ))}
-      </View>
-
-      <ScrollView horizontal showsHorizontalScrollIndicator>
-        <View>
-          <View style={styles.row}>
+        <View style={styles.headerClip}>
+          <Animated.View style={[styles.row, { transform: [{ translateX: headerOffset }] }]}>
             {COLUMNS.map((column) => (
               <HeaderCell
                 key={column.key}
@@ -104,30 +93,83 @@ export function ResultsTable({ rows }: { rows: ScanRow[] }) {
                 onPress={handleSort}
               />
             ))}
-          </View>
-          {sorted.map((item, index) => (
-            <View
-              key={item.putSymbol}
-              style={[styles.row, index % 2 === 1 && styles.stripe]}
-            >
-              {COLUMNS.map((column) => (
-                <View key={column.key} style={[styles.cell, { width: column.width }]}>
-                  <Text numberOfLines={1} style={[styles.text, column.numeric && styles.numeric]}>
-                    {column.format(item)}
+          </Animated.View>
+        </View>
+      </View>
+
+      <ScrollView style={styles.vertical}>
+        <View style={styles.body}>
+          {/* Pinned ticker column: 11 more columns will not fit a phone, so the rest scroll. */}
+          <View>
+            {sorted.map((item, index) => (
+              <View
+                key={item.putSymbol}
+                style={[styles.row, index % 2 === 1 && styles.stripe]}
+              >
+                <View style={[styles.cell, { width: TICKER_COLUMN.width }]}>
+                  <Text numberOfLines={1} style={styles.tickerText}>
+                    {item.ticker}
                   </Text>
+                </View>
+              </View>
+            ))}
+          </View>
+
+          <Animated.ScrollView
+            horizontal
+            showsHorizontalScrollIndicator
+            scrollEventThrottle={16}
+            onScroll={Animated.event([{ nativeEvent: { contentOffset: { x: scrollX } } }], {
+              useNativeDriver: true,
+            })}
+          >
+            <View>
+              {sorted.map((item, index) => (
+                <View
+                  key={item.putSymbol}
+                  style={[styles.row, index % 2 === 1 && styles.stripe]}
+                >
+                  {COLUMNS.map((column) => (
+                    <View key={column.key} style={[styles.cell, { width: column.width }]}>
+                      <Text
+                        numberOfLines={1}
+                        style={[
+                          styles.text,
+                          column.numeric && styles.numeric,
+                          signStyle(column, item, theme),
+                        ]}
+                      >
+                        {column.format(item)}
+                      </Text>
+                    </View>
+                  ))}
                 </View>
               ))}
             </View>
-          ))}
+          </Animated.ScrollView>
         </View>
       </ScrollView>
     </View>
   );
 }
 
+/** Green above zero, red below; zero and blanks keep the default text color. */
+function signStyle(column: Column, row: ScanRow, theme: Theme) {
+  if (!column.signed) return null;
+  const value = row[column.key];
+  if (typeof value !== "number" || value === 0) return null;
+  return { color: value > 0 ? theme.positive : theme.negative };
+}
+
 const createStyles = (theme: Theme) =>
   StyleSheet.create({
-    container: { flexDirection: "row" },
+    table: { flex: 1 },
+    headerRow: { flexDirection: "row" },
+    // Clips the header cells the body has scrolled past, since they are translated
+    // rather than scrolled.
+    headerClip: { flex: 1, overflow: "hidden" },
+    vertical: { flex: 1 },
+    body: { flexDirection: "row" },
     row: { flexDirection: "row", height: ROW_HEIGHT, alignItems: "center" },
     stripe: { backgroundColor: theme.stripe },
     cell: {

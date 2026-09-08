@@ -95,26 +95,30 @@ export function ResultsScreen({ settings }: { settings: Settings }) {
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
 
-      <ScrollView style={styles.body}>
+      {/* The table scrolls itself so its header row can stay pinned, so it takes the
+          free space and the skipped list sits below it rather than scrolling with it. */}
+      <View style={styles.body}>
         {result && result.rows.length > 0 ? <ResultsTable rows={result.rows} /> : null}
+      </View>
 
-        {result && result.skipped.length > 0 ? (
-          <View style={styles.skipped}>
-            <Pressable onPress={() => setShowSkipped((prev) => !prev)}>
-              <Text style={styles.skippedHeader}>
-                {showSkipped ? "▼" : "▶"} Skipped ({result.skipped.length})
-              </Text>
-            </Pressable>
-            {showSkipped
-              ? result.skipped.map((s, i) => (
-                  <Text key={`${s.ticker}-${i}`} style={styles.skippedRow}>
-                    {s.ticker}: {s.reason}
-                  </Text>
-                ))
-              : null}
-          </View>
-        ) : null}
-      </ScrollView>
+      {result && result.skipped.length > 0 ? (
+        <View style={styles.skipped}>
+          <Pressable onPress={() => setShowSkipped((prev) => !prev)}>
+            <Text style={styles.skippedHeader}>
+              {showSkipped ? "▼" : "▶"} Skipped ({result.skipped.length})
+            </Text>
+          </Pressable>
+          {showSkipped ? (
+            <ScrollView style={styles.skippedList}>
+              {result.skipped.map((s, i) => (
+                <Text key={`${s.ticker}-${i}`} style={styles.skippedRow}>
+                  {s.ticker}: {s.reason}
+                </Text>
+              ))}
+            </ScrollView>
+          ) : null}
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -150,7 +154,14 @@ const createStyles = (theme: Theme) =>
       paddingVertical: 8,
     },
     body: { flex: 1 },
-    skipped: { padding: 12 },
+    skipped: {
+      paddingHorizontal: 12,
+      paddingBottom: 12,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
+    },
+    /** Capped so expanding a long skip list cannot crowd out the table. */
+    skippedList: { maxHeight: 180 },
     skippedHeader: { fontSize: 13, fontWeight: "600", color: theme.muted, paddingVertical: 6 },
     skippedRow: { fontSize: 11, color: theme.muted, paddingVertical: 2 },
   });
