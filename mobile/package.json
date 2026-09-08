@@ -1,0 +1,28 @@
+{
+  "name": "put-bp-scan",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "typecheck": "tsc --noEmit",
+    "scan": "tsx scripts/scan-cli.ts"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "expo": "~57.0.20",
+    "expo-constants": "~57.0.17",
+    "expo-status-bar": "~57.0.1",
+    "expo-system-ui": "~57.0.3",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "~5.7.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.2",
+    "dotenv": "^17.2.3",
+    "tsx": "^4.23.13",
+    "typescript": "~6.0.3"
+  }
+}
