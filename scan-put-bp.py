@@ -2,7 +2,9 @@ import csv
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from dotenv import find_dotenv, load_dotenv
@@ -31,9 +33,12 @@ print(f"Environment: {_ENV} ({BASE_URL})", file=sys.stderr)
 
 _access_token = None
 _token_expires_at = 0
+_token_lock = threading.Lock()
 
 
 def _fetch_access_token():
+    """Callers must hold _token_lock: this mutates the shared token globals and
+    concurrent workers would otherwise each burn a refresh on the same expiry."""
     global _access_token, _token_expires_at
     resp = requests.post(
         f"{BASE_URL}/oauth/token",
@@ -54,7 +59,17 @@ def _fetch_access_token():
 
 def _ensure_token():
     if not _access_token or time.time() >= _token_expires_at:
-        _fetch_access_token()
+        with _token_lock:
+            if not _access_token or time.time() >= _token_expires_at:
+                _fetch_access_token()
+
+
+def _refresh_token_if_stale(stale_auth):
+    """Force-refresh after a 401, unless another thread already replaced the
+    token this caller used - so a simultaneous 401 storm costs one refresh."""
+    with _token_lock:
+        if stale_auth == f"Bearer {_access_token}":
+            _fetch_access_token()
 
 
 def _headers():
@@ -66,9 +81,10 @@ def _headers():
 
 def get(path, **params):
     _ensure_token()
-    r = requests.get(f"{BASE_URL}{path}", headers=_headers(), params=params)
+    headers = _headers()
+    r = requests.get(f"{BASE_URL}{path}", headers=headers, params=params)
     if r.status_code == 401:
-        _fetch_access_token()
+        _refresh_token_if_stale(headers["Authorization"])
         r = requests.get(f"{BASE_URL}{path}", headers=_headers(), params=params)
     if not r.ok:
         print(f"  URL: {r.url}", file=sys.stderr)
@@ -84,9 +100,10 @@ def post_dry_run(path, body):
     means this account can't currently afford the order, not that the request
     was malformed), so this returns the parsed body instead of raising on 422."""
     _ensure_token()
-    r = requests.post(f"{BASE_URL}{path}", headers=_headers(), json=body)
+    headers = _headers()
+    r = requests.post(f"{BASE_URL}{path}", headers=headers, json=body)
     if r.status_code == 401:
-        _fetch_access_token()
+        _refresh_token_if_stale(headers["Authorization"])
         r = requests.post(f"{BASE_URL}{path}", headers=_headers(), json=body)
     if r.status_code not in (200, 201, 422):
         print(f"  URL: {r.url}", file=sys.stderr)
@@ -98,6 +115,12 @@ def post_dry_run(path, body):
 
 
 TARGET_DTE = 45
+
+# Both per-ticker loops below are network-bound (one HTTP request per ticker), so
+# workers spend their time blocked on the API rather than on the CPU. Capped so a
+# many-core machine doesn't run into the API's rate limit.
+CONCURRENCY = min(os.cpu_count() or 4, 16)
+print(f"Concurrency: {CONCURRENCY} workers", file=sys.stderr)
 
 
 def chunked(seq, size):
@@ -204,49 +227,70 @@ def pick_put_strike(expiration, underlying_mid):
     return otm[-1]
 
 
+def _build_candidate(ticker, underlying_mid, underlying_ranges, ivr_by_ticker, ivx_by_ticker):
+    """Fetch one ticker's chain and pick its put. Returns (candidate or None, messages);
+    messages are returned rather than printed so concurrent workers don't interleave
+    their stderr output."""
+    msgs = [f"Fetching option chain for {ticker}..."]
+    try:
+        resp = get(f"/option-chains/{ticker}/nested")
+    except requests.HTTPError:
+        msgs.append(f"  {ticker}: option chain fetch failed, skipping")
+        return None, msgs
+    items = resp["data"]["items"]
+    if not items or not items[0]["expirations"]:
+        msgs.append(f"  {ticker}: no expirations found, skipping")
+        return None, msgs
+    expirations = items[0]["expirations"]
+    if not any(e["expiration-type"] == "Weekly" for e in expirations):
+        msgs.append(f"  {ticker}: no weekly options, skipping")
+        return None, msgs
+    expiration = pick_expiration(expirations)
+    strike = pick_put_strike(expiration, underlying_mid)
+    if strike is None:
+        msgs.append(f"  {ticker}: no OTM put strike found, skipping")
+        return None, msgs
+    strike_price = float(strike["strike-price"])
+    year_range = underlying_ranges.get(ticker)
+    strike_52wk_position = (
+        strike_position_in_52wk_range(strike_price, year_range) if year_range else None
+    )
+    candidate = {
+        "ticker": ticker,
+        "ivr": ivr_by_ticker.get(ticker),
+        "ivx": ivx_by_ticker.get(ticker),
+        "expiration": expiration["expiration-date"],
+        "dte": expiration["days-to-expiration"],
+        "strike": strike_price,
+        "put_symbol": strike["put"],
+        "strike_52wk_position": strike_52wk_position,
+    }
+    return candidate, msgs
+
+
 def find_candidates(tickers, underlying_mids, underlying_ranges, ivr_by_ticker, ivx_by_ticker):
-    candidates = []
+    quoted = []
     for ticker in sorted(tickers):
-        underlying_mid = underlying_mids.get(ticker)
-        if underlying_mid is None:
+        if underlying_mids.get(ticker) is None:
             print(f"  {ticker}: no underlying quote, skipping", file=sys.stderr)
             continue
-        print(f"Fetching option chain for {ticker}...", file=sys.stderr)
-        try:
-            resp = get(f"/option-chains/{ticker}/nested")
-        except requests.HTTPError:
-            print(f"  {ticker}: option chain fetch failed, skipping", file=sys.stderr)
-            continue
-        items = resp["data"]["items"]
-        if not items or not items[0]["expirations"]:
-            print(f"  {ticker}: no expirations found, skipping", file=sys.stderr)
-            continue
-        expirations = items[0]["expirations"]
-        if not any(e["expiration-type"] == "Weekly" for e in expirations):
-            print(f"  {ticker}: no weekly options, skipping", file=sys.stderr)
-            continue
-        expiration = pick_expiration(expirations)
-        strike = pick_put_strike(expiration, underlying_mid)
-        if strike is None:
-            print(f"  {ticker}: no OTM put strike found, skipping", file=sys.stderr)
-            continue
-        strike_price = float(strike["strike-price"])
-        year_range = underlying_ranges.get(ticker)
-        strike_52wk_position = (
-            strike_position_in_52wk_range(strike_price, year_range) if year_range else None
+        quoted.append(ticker)
+
+    candidates = []
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        # map() yields in submission order, so stderr and the candidate list stay
+        # in the same ticker order the serial version produced.
+        results = pool.map(
+            lambda t: _build_candidate(
+                t, underlying_mids[t], underlying_ranges, ivr_by_ticker, ivx_by_ticker
+            ),
+            quoted,
         )
-        candidates.append(
-            {
-                "ticker": ticker,
-                "ivr": ivr_by_ticker.get(ticker),
-                "ivx": ivx_by_ticker.get(ticker),
-                "expiration": expiration["expiration-date"],
-                "dte": expiration["days-to-expiration"],
-                "strike": strike_price,
-                "put_symbol": strike["put"],
-                "strike_52wk_position": strike_52wk_position,
-            }
-        )
+        for candidate, msgs in results:
+            for msg in msgs:
+                print(msg, file=sys.stderr)
+            if candidate is not None:
+                candidates.append(candidate)
     return candidates
 
 
@@ -272,24 +316,67 @@ def dry_run_order(account_number, put_symbol, price):
     return post_dry_run(f"/accounts/{account_number}/orders/dry-run", body)
 
 
-def extract_marginal_buying_power(resp, ticker=None, debug=False):
+def extract_marginal_buying_power(resp, msgs, ticker=None, debug=False):
     bpe = resp.get("data", {}).get("buying-power-effect", {})
     errors = resp.get("error", {}).get("errors", [])
 
     if debug:
-        print(f"  [debug] {ticker} dry-run buying-power-effect: {json.dumps(bpe)}", file=sys.stderr)
+        msgs.append(f"  [debug] {ticker} dry-run buying-power-effect: {json.dumps(bpe)}")
         if errors:
-            print(f"  [debug] {ticker} dry-run errors: {json.dumps(errors)}", file=sys.stderr)
+            msgs.append(f"  [debug] {ticker} dry-run errors: {json.dumps(errors)}")
 
     hard_errors = [e for e in errors if e.get("code") != "margin_check_failed"]
     if hard_errors and not bpe:
-        print(f"  {ticker}: preflight error: {hard_errors}", file=sys.stderr)
+        msgs.append(f"  {ticker}: preflight error: {hard_errors}")
         return None
 
     for key in ("isolated-order-margin-requirement", "change-in-buying-power", "change-in-margin-requirement"):
         if key in bpe:
             return abs(float(bpe[key]))
     return None
+
+
+def evaluate_candidate(account_number, candidate, credit_mid, debug=False):
+    """Dry-run one candidate's order and build its output row. Returns (row or None,
+    messages); like _build_candidate, messages are returned rather than printed."""
+    ticker = candidate["ticker"]
+    msgs = [f"Dry-running {ticker} {candidate['put_symbol']}..."]
+    try:
+        resp = dry_run_order(account_number, candidate["put_symbol"], credit_mid)
+    except requests.HTTPError:
+        msgs.append(f"  {ticker}: dry-run failed, skipping")
+        return None, msgs
+    marginal_bp = extract_marginal_buying_power(resp, msgs, ticker=ticker, debug=debug)
+    if marginal_bp is None:
+        msgs.append(f"  {ticker}: could not extract margin requirement, skipping")
+        return None, msgs
+    if marginal_bp <= 0:
+        msgs.append(
+            f"  {ticker}: dry-run shows $0 incremental margin requirement "
+            f"(account has ample buying-power cushion), skipping from ranking"
+        )
+        return None, msgs
+    credit = credit_mid * 100
+    notional = candidate["strike"] * 100
+    row = {
+        "ticker": ticker,
+        "ivr": f"{candidate['ivr'] * 100:.1f}" if candidate["ivr"] is not None else "",
+        "ivx": f"{candidate['ivx'] * 100:.1f}" if candidate["ivx"] is not None else "",
+        "expiration": candidate["expiration"],
+        "dte": candidate["dte"],
+        "strike": candidate["strike"],
+        "strike 52wk pct": (
+            f"{candidate['strike_52wk_position'] * 100:.1f}"
+            if candidate["strike_52wk_position"] is not None
+            else ""
+        ),
+        "credit": f"{credit:.1f}",
+        "buying_power": f"{marginal_bp:.1f}",
+        "credit to bpr": f"{credit / marginal_bp * 100:.1f}",
+        "bpr to notional": f"{marginal_bp / notional * 100:.1f}",
+        "credit to notional": f"{credit / notional * 100:.1f}",
+    }
+    return row, msgs
 
 
 FIELDNAMES = [
@@ -398,51 +485,26 @@ if __name__ == "__main__":
 
     option_mids = fetch_option_mids([c["put_symbol"] for c in candidates])
 
-    rows = []
-    for i, c in enumerate(candidates):
+    debug = "--debug" in sys.argv
+    pending = []
+    for c in candidates:
         credit_mid = option_mids.get(c["put_symbol"])
         if credit_mid is None:
             print(f"  {c['ticker']}: no option quote, skipping", file=sys.stderr)
             continue
-        print(f"Dry-running {c['ticker']} {c['put_symbol']}...", file=sys.stderr)
-        try:
-            resp = dry_run_order(account_number, c["put_symbol"], credit_mid)
-        except requests.HTTPError:
-            print(f"  {c['ticker']}: dry-run failed, skipping", file=sys.stderr)
-            continue
-        marginal_bp = extract_marginal_buying_power(resp, ticker=c["ticker"], debug=("--debug" in sys.argv))
-        if marginal_bp is None:
-            print(f"  {c['ticker']}: could not extract margin requirement, skipping", file=sys.stderr)
-            continue
-        if marginal_bp <= 0:
-            print(
-                f"  {c['ticker']}: dry-run shows $0 incremental margin requirement "
-                f"(account has ample buying-power cushion), skipping from ranking",
-                file=sys.stderr,
-            )
-            continue
-        credit = credit_mid * 100
-        notional = c["strike"] * 100
-        rows.append(
-            {
-                "ticker": c["ticker"],
-                "ivr": f"{c['ivr'] * 100:.1f}" if c["ivr"] is not None else "",
-                "ivx": f"{c['ivx'] * 100:.1f}" if c["ivx"] is not None else "",
-                "expiration": c["expiration"],
-                "dte": c["dte"],
-                "strike": c["strike"],
-                "strike 52wk pct": (
-                    f"{c['strike_52wk_position'] * 100:.1f}"
-                    if c["strike_52wk_position"] is not None
-                    else ""
-                ),
-                "credit": f"{credit:.1f}",
-                "buying_power": f"{marginal_bp:.1f}",
-                "credit to bpr": f"{credit / marginal_bp * 100:.1f}",
-                "bpr to notional": f"{marginal_bp / notional * 100:.1f}",
-                "credit to notional": f"{credit / notional * 100:.1f}",
-            }
+        pending.append((c, credit_mid))
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        results = pool.map(
+            lambda item: evaluate_candidate(account_number, item[0], item[1], debug),
+            pending,
         )
+        for row, msgs in results:
+            for msg in msgs:
+                print(msg, file=sys.stderr)
+            if row is not None:
+                rows.append(row)
 
     rows.sort(key=lambda r: float(r["credit to bpr"]), reverse=True)
 
