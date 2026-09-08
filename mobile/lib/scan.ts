@@ -83,6 +83,7 @@ type Quote = {
   last?: string | null;
   "year-low-price"?: string | null;
   "year-high-price"?: string | null;
+  "prev-close"?: string | null;
 };
 
 /** Bid/ask midpoint, falling back to last. */
@@ -97,6 +98,12 @@ function mid(item: Quote): number | null {
 function strikePositionIn52wkRange(strike: number, [low, high]: [number, number]): number | null {
   if (high === low) return null;
   return (strike - low) / (high - low);
+}
+
+/** Fraction the underlying's mid has moved from the previous day's close. */
+function changeFromPrevClose(underlyingMid: number, prevClose: number | undefined): number | null {
+  if (prevClose == null || prevClose === 0) return null;
+  return (underlyingMid - prevClose) / prevClose;
 }
 
 function roundToNickel(price: number): number {
@@ -182,11 +189,12 @@ export async function runScan({
   report("metrics", metricChunks.length, metricChunks.length);
   tickers = kept.sort();
 
-  // Underlying quotes and 52-week ranges.
+  // Underlying quotes, 52-week ranges and previous closes.
   throwIfAborted(signal);
   const quoteChunks = chunked(tickers, CHUNK_SIZE);
   const underlyingMids = new Map<string, number | null>();
   const underlyingRanges = new Map<string, [number, number]>();
+  const prevCloses = new Map<string, number>();
   for (const [i, chunk] of quoteChunks.entries()) {
     report("quotes", i, quoteChunks.length);
     const resp = await get("/market-data/by-type", { equity: chunk.join(",") }, signal);
@@ -197,6 +205,8 @@ export async function runScan({
       if (low != null && high != null) {
         underlyingRanges.set(item.symbol, [parseFloat(low), parseFloat(high)]);
       }
+      const prevClose = item["prev-close"];
+      if (prevClose != null) prevCloses.set(item.symbol, parseFloat(prevClose));
     }
   }
   report("quotes", quoteChunks.length, quoteChunks.length);
@@ -210,6 +220,7 @@ export async function runScan({
     strike: number;
     putSymbol: string;
     strike52wkPosition: number | null;
+    chg: number | null;
   };
   let chainsDone = 0;
   report("chains", 0, tickers.length);
@@ -266,6 +277,7 @@ export async function runScan({
         strike: strike.price,
         putSymbol: strike.put,
         strike52wkPosition: range ? strikePositionIn52wkRange(strike.price, range) : null,
+        chg: changeFromPrevClose(underlyingMid, prevCloses.get(ticker)),
       };
     },
     () => report("chains", ++chainsDone, tickers.length),
@@ -350,6 +362,7 @@ export async function runScan({
         dte: c.dte,
         strike: c.strike,
         strike52wkPct: c.strike52wkPosition === null ? null : c.strike52wkPosition * 100,
+        chgPct: c.chg === null ? null : c.chg * 100,
         credit,
         buyingPower: marginalBp,
         creditToBpr: (credit / marginalBp) * 100,

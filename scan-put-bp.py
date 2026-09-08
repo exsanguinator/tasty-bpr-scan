@@ -149,6 +149,7 @@ def resolve_tickers(watchlist_names):
 def fetch_equity_mids(tickers):
     mids = {}
     ranges = {}
+    prev_closes = {}
     for chunk in chunked(sorted(tickers), 100):
         resp = get("/market-data/by-type", equity=",".join(chunk))
         for item in resp["data"]["items"]:
@@ -157,7 +158,10 @@ def fetch_equity_mids(tickers):
             year_high = item.get("year-high-price")
             if year_low is not None and year_high is not None:
                 ranges[item["symbol"]] = (float(year_low), float(year_high))
-    return mids, ranges
+            prev_close = item.get("prev-close")
+            if prev_close is not None:
+                prev_closes[item["symbol"]] = float(prev_close)
+    return mids, ranges, prev_closes
 
 
 def strike_position_in_52wk_range(strike, year_range):
@@ -166,6 +170,13 @@ def strike_position_in_52wk_range(strike, year_range):
     if year_high == year_low:
         return None
     return (strike - year_low) / (year_high - year_low)
+
+
+def change_from_prev_close(underlying_mid, prev_close):
+    """Fraction the underlying's mid has moved from the previous day's close."""
+    if prev_close is None or prev_close == 0:
+        return None
+    return (underlying_mid - prev_close) / prev_close
 
 
 def fetch_option_mids(symbols):
@@ -227,7 +238,9 @@ def pick_put_strike(expiration, underlying_mid):
     return otm[-1]
 
 
-def _build_candidate(ticker, underlying_mid, underlying_ranges, ivr_by_ticker, ivx_by_ticker):
+def _build_candidate(
+    ticker, underlying_mid, underlying_ranges, prev_closes, ivr_by_ticker, ivx_by_ticker
+):
     """Fetch one ticker's chain and pick its put. Returns (candidate or None, messages);
     messages are returned rather than printed so concurrent workers don't interleave
     their stderr output."""
@@ -264,11 +277,14 @@ def _build_candidate(ticker, underlying_mid, underlying_ranges, ivr_by_ticker, i
         "strike": strike_price,
         "put_symbol": strike["put"],
         "strike_52wk_position": strike_52wk_position,
+        "chg": change_from_prev_close(underlying_mid, prev_closes.get(ticker)),
     }
     return candidate, msgs
 
 
-def find_candidates(tickers, underlying_mids, underlying_ranges, ivr_by_ticker, ivx_by_ticker):
+def find_candidates(
+    tickers, underlying_mids, underlying_ranges, prev_closes, ivr_by_ticker, ivx_by_ticker
+):
     quoted = []
     for ticker in sorted(tickers):
         if underlying_mids.get(ticker) is None:
@@ -282,7 +298,12 @@ def find_candidates(tickers, underlying_mids, underlying_ranges, ivr_by_ticker, 
         # in the same ticker order the serial version produced.
         results = pool.map(
             lambda t: _build_candidate(
-                t, underlying_mids[t], underlying_ranges, ivr_by_ticker, ivx_by_ticker
+                t,
+                underlying_mids[t],
+                underlying_ranges,
+                prev_closes,
+                ivr_by_ticker,
+                ivx_by_ticker,
             ),
             quoted,
         )
@@ -370,6 +391,7 @@ def evaluate_candidate(account_number, candidate, credit_mid, debug=False):
             if candidate["strike_52wk_position"] is not None
             else ""
         ),
+        "chg%": f"{candidate['chg'] * 100:.2f}" if candidate["chg"] is not None else "",
         "credit": f"{credit:.1f}",
         "buying_power": f"{marginal_bp:.1f}",
         "credit to bpr": f"{credit / marginal_bp * 100:.1f}",
@@ -385,6 +407,7 @@ FIELDNAMES = [
     "dte",
     "strike",
     "strike 52wk pct",
+    "chg%",
     "credit",
     "buying_power",
     "credit to bpr",
@@ -480,8 +503,10 @@ if __name__ == "__main__":
     tickers, ivr_by_ticker, ivx_by_ticker = filter_by_liquidity(tickers)
     print(f"{len(tickers)} tickers remain after liquidity filter: {sorted(tickers)}", file=sys.stderr)
 
-    underlying_mids, underlying_ranges = fetch_equity_mids(tickers)
-    candidates = find_candidates(tickers, underlying_mids, underlying_ranges, ivr_by_ticker, ivx_by_ticker)
+    underlying_mids, underlying_ranges, prev_closes = fetch_equity_mids(tickers)
+    candidates = find_candidates(
+        tickers, underlying_mids, underlying_ranges, prev_closes, ivr_by_ticker, ivx_by_ticker
+    )
 
     option_mids = fetch_option_mids([c["put_symbol"] for c in candidates])
 
