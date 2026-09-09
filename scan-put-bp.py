@@ -766,7 +766,13 @@ def write_html(rows, out=sys.stdout):
   table {{ border-collapse: collapse; }}
   th, td {{ border: 1px solid #2c3138; padding: 4px 8px; text-align: right; }}
   th:first-child, td:first-child {{ text-align: left; }}
-  th {{ cursor: pointer; background: #21262c; user-select: none; }}
+  /* Sticky header: with border-collapse the th's own border scrolls away with
+     the cells, so the bottom edge is drawn as a box-shadow instead. */
+  th {{
+    cursor: pointer; background: #21262c; user-select: none;
+    position: sticky; top: 0; z-index: 1;
+    box-shadow: inset 0 -1px 0 #2c3138;
+  }}
   tbody tr:nth-child(even) {{ background: #171a1e; }}
   th.asc::after {{ content: " \\25B2"; }}
   th.desc::after {{ content: " \\25BC"; }}
