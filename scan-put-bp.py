@@ -428,9 +428,23 @@ def write_html(rows, out=sys.stdout):
     def cell(value):
         return "" if value == "" else str(value)
 
+    def cell_class(name, value):
+        """chg% is the only signed column, so colour it by sign; zero stays neutral."""
+        if name != "chg%" or value == "":
+            return ""
+        change = float(value)
+        if change > 0:
+            return ' class="pos"'
+        if change < 0:
+            return ' class="neg"'
+        return ""
+
     header_cells = "".join(f"<th onclick=\"sortTable({i})\">{name}</th>" for i, name in enumerate(FIELDNAMES))
     body_rows = "\n".join(
-        "<tr>" + "".join(f"<td>{cell(row[name])}</td>" for name in FIELDNAMES) + "</tr>" for row in rows
+        "<tr>"
+        + "".join(f"<td{cell_class(name, row[name])}>{cell(row[name])}</td>" for name in FIELDNAMES)
+        + "</tr>"
+        for row in rows
     )
 
     out.write(f"""<!doctype html>
@@ -439,13 +453,17 @@ def write_html(rows, out=sys.stdout):
 <meta charset="utf-8">
 <title>scan-put-bp results</title>
 <style>
-  body {{ font-family: sans-serif; font-size: 14px; }}
+  /* Dark palette, matching the mobile app's dark theme (mobile/lib/theme.ts). */
+  body {{ font-family: sans-serif; font-size: 14px; background: #121417; color: #e7e9ec; }}
   table {{ border-collapse: collapse; }}
-  th, td {{ border: 1px solid #ccc; padding: 4px 8px; text-align: right; }}
+  th, td {{ border: 1px solid #2c3138; padding: 4px 8px; text-align: right; }}
   th:first-child, td:first-child {{ text-align: left; }}
-  th {{ cursor: pointer; background: #eee; user-select: none; }}
+  th {{ cursor: pointer; background: #21262c; user-select: none; }}
+  tbody tr:nth-child(even) {{ background: #171a1e; }}
   th.asc::after {{ content: " \\25B2"; }}
   th.desc::after {{ content: " \\25BC"; }}
+  td.pos {{ color: #5fd894; }}
+  td.neg {{ color: #ff9a90; }}
 </style>
 </head>
 <body>
