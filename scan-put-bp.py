@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import os
 import sys
 import threading
@@ -8,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from dotenv import find_dotenv, load_dotenv
+from scipy.optimize import brentq
+from scipy.stats import norm
 
 load_dotenv(find_dotenv())
 
@@ -128,6 +131,26 @@ def chunked(seq, size):
         yield seq[i : i + size]
 
 
+DEFAULT_RISK_FREE_RATE = 0.04
+
+
+def fetch_risk_free_rate():
+    """/margin-requirements-public-configuration needs no auth and the API docs
+    endorse its rate as a Black-Scholes input. Falls back to a constant rather
+    than failing the scan, since skew barely moves with a few bps of error."""
+    try:
+        resp = get("/margin-requirements-public-configuration")
+        rate = float(resp["data"]["risk-free-rate"])
+    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+        print(
+            f"Risk-free rate fetch failed ({exc}); using {DEFAULT_RISK_FREE_RATE}",
+            file=sys.stderr,
+        )
+        return DEFAULT_RISK_FREE_RATE
+    print(f"Risk-free rate: {rate}", file=sys.stderr)
+    return rate
+
+
 def load_config(path):
     with open(path) as f:
         return json.load(f)
@@ -147,21 +170,47 @@ def resolve_tickers(watchlist_names):
 
 
 def fetch_equity_mids(tickers):
+    """Returns (mids, underlying_by_ticker). The per-ticker dict carries everything
+    downstream needs about the underlying, so adding a field here doesn't mean
+    adding another positional argument to every function in the call chain."""
     mids = {}
-    ranges = {}
-    prev_closes = {}
+    underlying = {}
     for chunk in chunked(sorted(tickers), 100):
         resp = get("/market-data/by-type", equity=",".join(chunk))
         for item in resp["data"]["items"]:
-            mids[item["symbol"]] = _mid(item)
+            symbol = item["symbol"]
+            mids[symbol] = _mid(item)
             year_low = item.get("year-low-price")
             year_high = item.get("year-high-price")
-            if year_low is not None and year_high is not None:
-                ranges[item["symbol"]] = (float(year_low), float(year_high))
             prev_close = item.get("prev-close")
-            if prev_close is not None:
-                prev_closes[item["symbol"]] = float(prev_close)
-    return mids, ranges, prev_closes
+            underlying[symbol] = {
+                "year_range": (
+                    (float(year_low), float(year_high))
+                    if year_low is not None and year_high is not None
+                    else None
+                ),
+                "prev_close": float(prev_close) if prev_close is not None else None,
+            }
+    return mids, underlying
+
+
+def _float_or_none(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# Dividends are ignored: the forward is approximated by spot. /market-data/by-type
+# gives a dividend amount and frequency but no ex-dates, and annualizing a
+# quarterly payment across a ~45-day window assumes a dividend that most windows
+# do not contain. Measured on production quotes, doing so moved skew by up to 6.5
+# points on a 6%-yield name - larger than the spread of the metric itself - and
+# pushed the highest-yielding names to the top of the call-skew ranking, which is
+# not a real effect. See the `skew` notes in README.md.
+DIVIDEND_YIELD = 0.0
 
 
 def strike_position_in_52wk_range(strike, year_range):
@@ -179,40 +228,68 @@ def change_from_prev_close(underlying_mid, prev_close):
     return (underlying_mid - prev_close) / prev_close
 
 
-def fetch_option_mids(symbols):
-    mids = {}
-    for chunk in chunked(sorted(symbols), 100):
+def fetch_option_quotes(symbols):
+    """Returns the raw quote item per symbol, so callers can pick their own mid:
+    the credit path tolerates a `last` fallback, the skew path does not.
+
+    The chunk loop is parallel because skew multiplies the symbol count by an
+    order of magnitude, and serially those chunks would be the only unparallelized
+    phase left in the scan."""
+    chunks = list(chunked(sorted(set(symbols)), 100))
+    if not chunks:
+        return {}
+
+    def fetch(chunk):
         resp = get("/market-data/by-type", **{"equity-option": ",".join(chunk)})
-        for item in resp["data"]["items"]:
-            mids[item["symbol"]] = _mid(item)
-    return mids
+        return resp["data"]["items"]
+
+    quotes = {}
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        for items in pool.map(fetch, chunks):
+            for item in items:
+                quotes[item["symbol"]] = item
+    return quotes
 
 
 MIN_LIQUIDITY_RATING = 2
 
 
 def filter_by_liquidity(tickers):
+    """Returns (kept, metrics_by_ticker). Each metrics entry holds ivr, ivx and
+    exp_ivs, the per-expiration implied volatilities that seed the skew strike
+    search."""
     kept = set()
-    ivr_by_ticker = {}
-    ivx_by_ticker = {}
+    metrics = {}
     for chunk in chunked(sorted(tickers), 100):
         resp = get("/market-metrics", symbols=",".join(chunk))
         for item in resp["data"]["items"]:
-            ivr = item.get("implied-volatility-index-rank")
-            if ivr is not None:
-                ivr_by_ticker[item["symbol"]] = float(ivr)
-            ivx = item.get("implied-volatility-index")
-            if ivx is not None:
-                ivx_by_ticker[item["symbol"]] = float(ivx)
+            symbol = item["symbol"]
+            metrics[symbol] = {
+                "ivr": _float_or_none(item.get("implied-volatility-index-rank")),
+                "ivx": _float_or_none(item.get("implied-volatility-index")),
+                "exp_ivs": _expiration_ivs(item),
+            }
             rating = item.get("liquidity-rating")
             if rating is not None and rating >= MIN_LIQUIDITY_RATING:
-                kept.add(item["symbol"])
+                kept.add(symbol)
             else:
                 print(
-                    f"  {item['symbol']}: liquidity-rating {rating} < {MIN_LIQUIDITY_RATING}, skipping",
+                    f"  {symbol}: liquidity-rating {rating} < {MIN_LIQUIDITY_RATING}, skipping",
                     file=sys.stderr,
                 )
-    return kept, ivr_by_ticker, ivx_by_ticker
+    return kept, metrics
+
+
+def _expiration_ivs(item):
+    """Keyed by YYYY-MM-DD: market-metrics can return a full timestamp where the
+    option chain returns a plain date, so both sides are truncated to match."""
+    ivs = {}
+    for entry in item.get("option-expiration-implied-volatilities") or []:
+        date = entry.get("expiration-date")
+        iv = _float_or_none(entry.get("implied-volatility"))
+        if date and iv:
+            ivs[date[:10]] = iv
+    return ivs
 
 
 def _mid(item):
@@ -222,6 +299,86 @@ def _mid(item):
         return (float(bid) + float(ask)) / 2
     last = item.get("last")
     return float(last) if last is not None else None
+
+
+def _two_sided_mid(item):
+    """Stricter than _mid: no `last` fallback. A stale last print on an illiquid
+    wing strike inverts to a plausible-looking but meaningless implied vol, and
+    nothing downstream can tell that apart from a real quote."""
+    bid = _float_or_none(item.get("bid"))
+    ask = _float_or_none(item.get("ask"))
+    if bid is None or ask is None or bid <= 0 or ask <= bid:
+        return None
+    return (bid + ask) / 2, bid, ask
+
+
+# Black-Scholes with a continuous dividend yield. European, while US equity
+# options are American - see the `skew` column notes in README.md for the size
+# and direction of the resulting bias.
+SIGMA_BRACKET = (0.01, 3.0)
+MIN_SIGMA = 0.03
+MAX_SIGMA = 3.0
+MIN_VEGA = 1.0
+MIN_OPTION_MID = 0.10
+# Widest quote accepted, as the larger of an absolute and a relative bound. The
+# absolute floor matters on its own: a nickel-wide market on a $0.15 option is 33%
+# wide but perfectly ordinary.
+# 0.50 rather than something tighter because option quotes go wide after the
+# close, and the scan is often run then. Measured against production closing
+# quotes, tightening to 0.30 dropped coverage from 132 of 150 tickers to 113 while
+# leaving the median skew of the names that survived both settings unchanged.
+MAX_SPREAD_ABSOLUTE = 0.10
+MAX_SPREAD_RELATIVE = 0.50
+
+
+def bs_d1(s, k, t, r, q, sigma):
+    return (math.log(s / k) + (r - q + sigma * sigma / 2) * t) / (sigma * math.sqrt(t))
+
+
+def bs_price(is_call, s, k, t, r, q, sigma):
+    d1 = bs_d1(s, k, t, r, q, sigma)
+    d2 = d1 - sigma * math.sqrt(t)
+    if is_call:
+        return s * math.exp(-q * t) * norm.cdf(d1) - k * math.exp(-r * t) * norm.cdf(d2)
+    return k * math.exp(-r * t) * norm.cdf(-d2) - s * math.exp(-q * t) * norm.cdf(-d1)
+
+
+def bs_delta(is_call, s, k, t, r, q, sigma):
+    d1 = bs_d1(s, k, t, r, q, sigma)
+    return math.exp(-q * t) * (norm.cdf(d1) if is_call else norm.cdf(d1) - 1)
+
+
+def bs_vega(s, k, t, r, q, sigma):
+    """Per 1.00 of vol, and per contract: 100 shares, so a vega of 1.0 is a cent
+    of option price per vol point."""
+    d1 = bs_d1(s, k, t, r, q, sigma)
+    return s * math.exp(-q * t) * norm.pdf(d1) * math.sqrt(t) * 100
+
+
+def european_lower_bound(is_call, s, k, t, r, q):
+    forward = s * math.exp(-q * t)
+    discounted_strike = k * math.exp(-r * t)
+    return max(0.0, forward - discounted_strike if is_call else discounted_strike - forward)
+
+
+def implied_vol(is_call, price, s, k, t, r, q):
+    """Returns None rather than clamping when the price falls outside the sigma
+    bracket: a solution pinned to an endpoint is not a solution, and it would
+    distort the interpolation far more than a missing point does."""
+    lo, hi = SIGMA_BRACKET
+    try:
+        sigma = brentq(
+            lambda sig: bs_price(is_call, s, k, t, r, q, sig) - price, lo, hi, xtol=1e-6
+        )
+    except (ValueError, RuntimeError):
+        return None
+    if sigma <= lo + 1e-4 or sigma >= hi - 1e-4:
+        return None
+    if not MIN_SIGMA <= sigma <= MAX_SIGMA:
+        return None
+    if bs_vega(s, k, t, r, q, sigma) < MIN_VEGA:
+        return None
+    return sigma
 
 
 def pick_expiration(expirations):
@@ -238,9 +395,134 @@ def pick_put_strike(expiration, underlying_mid):
     return otm[-1]
 
 
-def _build_candidate(
-    ticker, underlying_mid, underlying_ranges, prev_closes, ivr_by_ticker, ivx_by_ticker
-):
+TARGET_SKEW_DELTA = 0.25
+SKEW_STRIKES_PER_SIDE = 8
+# Wide, and in *seed* delta rather than true delta. The seed is an at-the-money
+# vol, so on the call side of an equity smile the true vol runs below it and the
+# true deltas come in lower than the seed suggests - a narrower window left names
+# like SPY with no strike anywhere near 25 delta.
+SKEW_DELTA_WINDOW = (0.08, 0.60)
+# Equity smiles put the true put vol above the seed and the call vol below it, so
+# each side's window is centred with a seed nudged the way the smile leans.
+SKEW_SEED_BIAS = {"call": 0.90, "put": 1.15}
+# Widest gap in d1 the interpolation will span, and how far past the outermost
+# point it will extrapolate. Beyond either, the chain is too sparse to say
+# anything about the 25-delta vol.
+MAX_INTERP_WIDTH = 0.60
+MAX_EXTRAP_DISTANCE = 0.15
+
+
+def select_skew_strikes(strikes, spot, t, r, q, sigma_seed, per_side=SKEW_STRIKES_PER_SIDE):
+    """Picks the strikes to quote for each side of the skew. Returns
+    (call_entries, put_entries) as (strike_price, occ_symbol) pairs, or empty
+    lists when the chain is too sparse around 25 delta to interpolate."""
+    low, high = SKEW_DELTA_WINDOW
+    sides = {}
+    for side, is_call in (("call", True), ("put", False)):
+        sigma = sigma_seed * SKEW_SEED_BIAS[side]
+        scored = []
+        for entry in strikes:
+            strike = _float_or_none(entry.get("strike-price"))
+            symbol = entry.get(side)
+            if strike is None or strike <= 0 or not symbol:
+                continue
+            delta = abs(bs_delta(is_call, spot, strike, t, r, q, sigma))
+            if low <= delta <= high:
+                scored.append((abs(delta - TARGET_SKEW_DELTA), strike, symbol))
+        scored.sort()
+        kept = [(strike, symbol) for _, strike, symbol in scored[:per_side]]
+        sides[side] = kept if len(kept) >= 2 else []
+    return sides["call"], sides["put"]
+
+
+def _solve_side(is_call, entries, quotes, s, t, r, q):
+    """Inverts each quoted strike to an implied vol. Returns [(x, iv)] where x is
+    d1 for calls and -d1 for puts, so both sides share one target coordinate."""
+    points = []
+    for strike, symbol in entries:
+        item = quotes.get(symbol)
+        if item is None:
+            continue
+        two_sided = _two_sided_mid(item)
+        if two_sided is None:
+            continue
+        mid, bid, ask = two_sided
+        if mid < MIN_OPTION_MID:
+            continue
+        if (ask - bid) > max(MAX_SPREAD_ABSOLUTE, MAX_SPREAD_RELATIVE * mid):
+            continue
+        if mid <= european_lower_bound(is_call, s, strike, t, r, q) + 0.01:
+            continue
+        sigma = implied_vol(is_call, mid, s, strike, t, r, q)
+        if sigma is None:
+            continue
+        d1 = bs_d1(s, strike, t, r, q, sigma)
+        points.append((d1 if is_call else -d1, sigma))
+    points.sort()
+    return points
+
+
+def interpolate_iv_at_delta(points, q, t, target_delta=TARGET_SKEW_DELTA):
+    """Interpolates implied vol at the target delta, working in d1 rather than in
+    delta directly. d1 is near-linear in log-moneyness so the smile is close to a
+    straight line across the window, while delta is steeply nonlinear in the
+    wings and is itself a function of the vol just solved."""
+    if len(points) < 2:
+        return None
+    target = norm.ppf(min(target_delta * math.exp(q * t), 1 - 1e-9))
+    for (x0, iv0), (x1, iv1) in zip(points, points[1:]):
+        if x0 <= target <= x1:
+            if x1 - x0 > MAX_INTERP_WIDTH:
+                return None
+            weight = 0.0 if x1 == x0 else (target - x0) / (x1 - x0)
+            return iv0 + weight * (iv1 - iv0)
+    # Not bracketed: extrapolate a short way off the nearest end, no further.
+    if target < points[0][0]:
+        (x0, iv0), (x1, iv1) = points[0], points[1]
+        distance = points[0][0] - target
+    else:
+        (x0, iv0), (x1, iv1) = points[-2], points[-1]
+        distance = target - points[-1][0]
+    if distance > MAX_EXTRAP_DISTANCE or x1 == x0:
+        return None
+    return iv0 + (target - x0) / (x1 - x0) * (iv1 - iv0)
+
+
+def compute_skew(candidate, quotes, spot):
+    """(IV_25d_call - IV_25d_put) / (IV_25d_call + IV_25d_put), in [-1, 1].
+    Returns (skew or None, messages)."""
+    ticker = candidate["ticker"]
+    msgs = []
+    calls, puts = candidate.get("skew_calls"), candidate.get("skew_puts")
+    if not calls or not puts or not spot:
+        return None, msgs
+    t = candidate["skew_t"]
+    r = candidate["risk_free_rate"]
+    q = DIVIDEND_YIELD
+
+    ivs = {}
+    for side, is_call, entries in (("call", True, calls), ("put", False, puts)):
+        points = _solve_side(is_call, entries, quotes, spot, t, r, q)
+        iv = interpolate_iv_at_delta(points, q, t)
+        if iv is None:
+            # |delta| = exp(-qt) * N(x) on both sides, by construction of x.
+            deltas = [math.exp(-q * t) * norm.cdf(x) for x, _ in points]
+            span = f"{min(deltas):.2f}-{max(deltas):.2f}" if deltas else "none"
+            msgs.append(
+                f"  {ticker}: no 25-delta {side} vol "
+                f"({len(points)} usable strikes, deltas {span}, seed {candidate['skew_seed']:.3f})"
+            )
+        ivs[side] = iv
+
+    if ivs["call"] is None or ivs["put"] is None:
+        return None, msgs
+    total = ivs["call"] + ivs["put"]
+    if total <= 0:
+        return None, msgs
+    return (ivs["call"] - ivs["put"]) / total, msgs
+
+
+def _build_candidate(ticker, underlying_mid, underlying_by_ticker, metrics_by_ticker, rate):
     """Fetch one ticker's chain and pick its put. Returns (candidate or None, messages);
     messages are returned rather than printed so concurrent workers don't interleave
     their stderr output."""
@@ -264,27 +546,53 @@ def _build_candidate(
         msgs.append(f"  {ticker}: no OTM put strike found, skipping")
         return None, msgs
     strike_price = float(strike["strike-price"])
-    year_range = underlying_ranges.get(ticker)
+    underlying = underlying_by_ticker.get(ticker, {})
+    metrics = metrics_by_ticker.get(ticker, {})
+    year_range = underlying.get("year_range")
     strike_52wk_position = (
         strike_position_in_52wk_range(strike_price, year_range) if year_range else None
     )
     candidate = {
         "ticker": ticker,
-        "ivr": ivr_by_ticker.get(ticker),
-        "ivx": ivx_by_ticker.get(ticker),
+        "ivr": metrics.get("ivr"),
+        "ivx": metrics.get("ivx"),
         "expiration": expiration["expiration-date"],
         "dte": expiration["days-to-expiration"],
         "strike": strike_price,
         "put_symbol": strike["put"],
         "strike_52wk_position": strike_52wk_position,
-        "chg": change_from_prev_close(underlying_mid, prev_closes.get(ticker)),
+        "chg": change_from_prev_close(underlying_mid, underlying.get("prev_close")),
+        "risk_free_rate": rate,
+        "skew": None,
     }
+    _attach_skew_strikes(candidate, expiration, underlying_mid, metrics, rate, msgs)
     return candidate, msgs
 
 
-def find_candidates(
-    tickers, underlying_mids, underlying_ranges, prev_closes, ivr_by_ticker, ivx_by_ticker
-):
+def _attach_skew_strikes(candidate, expiration, spot, metrics, rate, msgs):
+    """Chooses which strikes the skew calculation will need quotes for. Runs here
+    because the chain is already in hand, so strike selection costs no request;
+    only the quotes themselves do."""
+    ticker = candidate["ticker"]
+    date = str(expiration["expiration-date"])[:10]
+    seed = metrics.get("exp_ivs", {}).get(date) or metrics.get("ivx")
+    if not seed:
+        msgs.append(f"  {ticker}: no seed IV for {date}, skipping skew")
+        return
+    # Calendar time, matching the ACT/365 convention behind the ivx column.
+    t = max(candidate["dte"], 1) / 365.0
+    q = DIVIDEND_YIELD
+    calls, puts = select_skew_strikes(expiration["strikes"], spot, t, rate, q, seed)
+    if not calls or not puts:
+        msgs.append(f"  {ticker}: too few strikes near 25 delta, skipping skew")
+        return
+    candidate["skew_calls"] = calls
+    candidate["skew_puts"] = puts
+    candidate["skew_t"] = t
+    candidate["skew_seed"] = seed
+
+
+def find_candidates(tickers, underlying_mids, underlying_by_ticker, metrics_by_ticker, rate):
     quoted = []
     for ticker in sorted(tickers):
         if underlying_mids.get(ticker) is None:
@@ -298,12 +606,7 @@ def find_candidates(
         # in the same ticker order the serial version produced.
         results = pool.map(
             lambda t: _build_candidate(
-                t,
-                underlying_mids[t],
-                underlying_ranges,
-                prev_closes,
-                ivr_by_ticker,
-                ivx_by_ticker,
+                t, underlying_mids[t], underlying_by_ticker, metrics_by_ticker, rate
             ),
             quoted,
         )
@@ -392,6 +695,7 @@ def evaluate_candidate(account_number, candidate, credit_mid, debug=False):
             else ""
         ),
         "chg%": f"{candidate['chg'] * 100:.2f}" if candidate["chg"] is not None else "",
+        "skew": f"{candidate['skew'] * 100:.1f}" if candidate.get("skew") is not None else "",
         "credit": f"{credit:.1f}",
         "buying_power": f"{marginal_bp:.1f}",
         "credit to bpr": f"{credit / marginal_bp * 100:.1f}",
@@ -415,7 +719,11 @@ FIELDNAMES = [
     "credit to notional",
     "ivr",
     "ivx",
+    "skew",
 ]
+
+# Columns rendered green when positive and red when negative; zero stays neutral.
+SIGNED_COLUMNS = frozenset({"chg%", "skew"})
 
 
 def write_csv(rows, out=sys.stdout):
@@ -429,8 +737,8 @@ def write_html(rows, out=sys.stdout):
         return "" if value == "" else str(value)
 
     def cell_class(name, value):
-        """chg% is the only signed column, so colour it by sign; zero stays neutral."""
-        if name != "chg%" or value == "":
+        """Colour the signed columns by sign; zero and blanks stay neutral."""
+        if name not in SIGNED_COLUMNS or value == "":
             return ""
         change = float(value)
         if change > 0:
@@ -518,23 +826,43 @@ if __name__ == "__main__":
     tickers = resolve_tickers(watchlist_names)
     print(f"Resolved {len(tickers)} unique tickers: {sorted(tickers)}", file=sys.stderr)
 
-    tickers, ivr_by_ticker, ivx_by_ticker = filter_by_liquidity(tickers)
+    tickers, metrics_by_ticker = filter_by_liquidity(tickers)
     print(f"{len(tickers)} tickers remain after liquidity filter: {sorted(tickers)}", file=sys.stderr)
 
-    underlying_mids, underlying_ranges, prev_closes = fetch_equity_mids(tickers)
+    rate = fetch_risk_free_rate()
+    underlying_mids, underlying_by_ticker = fetch_equity_mids(tickers)
     candidates = find_candidates(
-        tickers, underlying_mids, underlying_ranges, prev_closes, ivr_by_ticker, ivx_by_ticker
+        tickers, underlying_mids, underlying_by_ticker, metrics_by_ticker, rate
     )
 
-    option_mids = fetch_option_mids([c["put_symbol"] for c in candidates])
+    skew_symbols = [
+        symbol
+        for c in candidates
+        for entries in (c.get("skew_calls") or [], c.get("skew_puts") or [])
+        for _, symbol in entries
+    ]
+    quotes = fetch_option_quotes([c["put_symbol"] for c in candidates] + skew_symbols)
+
+    # The mids fetched above are stale by roughly one full chain-fetch phase, and a
+    # wrong spot moves call and put IV in opposite directions, landing straight on
+    # the skew. Two requests buys a spot contemporaneous with the option quotes.
+    skew_spots, _ = fetch_equity_mids({c["ticker"] for c in candidates})
 
     debug = "--debug" in sys.argv
     pending = []
     for c in candidates:
-        credit_mid = option_mids.get(c["put_symbol"])
+        quote = quotes.get(c["put_symbol"])
+        credit_mid = _mid(quote) if quote else None
         if credit_mid is None:
             print(f"  {c['ticker']}: no option quote, skipping", file=sys.stderr)
             continue
+        spot = skew_spots.get(c["ticker"]) or underlying_mids.get(c["ticker"])
+        try:
+            c["skew"], skew_msgs = compute_skew(c, quotes, spot)
+        except Exception as exc:  # never let one ticker's smile kill the scan
+            c["skew"], skew_msgs = None, [f"  {c['ticker']}: skew failed ({exc})"]
+        for msg in skew_msgs:
+            print(msg, file=sys.stderr)
         pending.append((c, credit_mid))
 
     rows = []
