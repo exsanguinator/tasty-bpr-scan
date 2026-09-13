@@ -16,6 +16,8 @@ export type ScanRow = {
   creditToNotional: number;
   ivr: number | null;
   ivx: number | null;
+  /** 25-delta volatility skew, as a percentage: positive is call skew. */
+  skew: number | null;
   putSymbol: string;
 };
 
@@ -62,6 +64,14 @@ export const COLUMNS: Column[] = [
   { key: "creditToNotional", label: "cr/ntl", width: 72, numeric: true, format: (r) => oneDecimal(r.creditToNotional) },
   { key: "ivr", label: "ivr", width: 58, numeric: true, format: (r) => oneDecimal(r.ivr) },
   { key: "ivx", label: "ivx", width: 58, numeric: true, format: (r) => oneDecimal(r.ivx) },
+  {
+    key: "skew",
+    label: "skew",
+    width: 62,
+    numeric: true,
+    signed: true,
+    format: (r) => oneDecimal(r.skew),
+  },
 ];
 
 /** The ticker column is pinned outside the horizontal scroller. */
@@ -80,8 +90,10 @@ export function sortRows(rows: ScanRow[], key: ColumnKey, ascending: boolean): S
   const column = [TICKER_COLUMN, ...COLUMNS].find((c) => c.key === key);
   const direction = ascending ? 1 : -1;
   return [...rows].sort((a, b) => {
-    const av = a[key];
-    const bv = b[key];
+    // ?? null so a result cached by an older build, which has no field for a
+    // column added since, sorts last instead of comparing as NaN.
+    const av = a[key] ?? null;
+    const bv = b[key] ?? null;
     if (av === null && bv === null) return 0;
     if (av === null) return 1;
     if (bv === null) return -1;

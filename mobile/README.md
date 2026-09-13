@@ -65,6 +65,8 @@ but that needs this Mac serving the bundle.
 | `lib/config.ts` | Reads baked credentials; validates env is `prod` |
 | `lib/tastyClient.ts` | OAuth refresh-token flow, `get()` / `postDryRun()` |
 | `lib/scan.ts` | Port of `scan-put-bp.py`, plus account/watchlist fetches |
+| `lib/skew.ts` | 25-delta skew: strike selection, vol inversion, interpolation |
+| `lib/blackscholes.ts` | Normal CDF/PDF/quantile, Brent root-finder, Black-Scholes |
 | `lib/columns.ts` | Column definitions, formatters, numeric sort |
 | `lib/storage.ts` | AsyncStorage: settings and last scan result |
 | `lib/theme.ts` | Light/dark palettes, `ThemeProvider`, `useTheme()` |
@@ -75,13 +77,23 @@ but that needs this Mac serving the bundle.
 ## Behavioral differences from `scan-put-bp.py`
 
 - The per-ticker option-chain fetches and order dry-runs run **5 at a time** instead of
-  sequentially, and can be cancelled mid-scan.
+  sequentially, and can be cancelled mid-scan. The option quotes and the re-fetched spot
+  run as one parallel phase rather than two sequential ones.
+- `skew` is computed without scipy: `lib/blackscholes.ts` supplies the normal
+  distribution and a Brent root-finder in TypeScript. Cross-checked against
+  `scipy.stats.norm` / `scipy.optimize.brentq` on synthetic smiles, and against a full
+  production watchlist run of `scan-put-bp.py`, where all 151 rows' `skew` matched to
+  the printed decimal.
 - Rows hold raw numbers and are formatted at render time, so table columns sort
   numerically rather than lexically.
-- `chg%` is colored green when positive and red when negative (zero and blanks keep the
-  default text color); the CSV from `scan-put-bp.py` is plain text.
+- `chg%` and `skew` are colored green when positive and red when negative (zero and
+  blanks keep the default text color); the CSV from `scan-put-bp.py` is plain text.
 - Skipped tickers and their reasons appear in a collapsible "Skipped" section instead of
-  going to stderr.
+  going to stderr. The `skew:` entries there are not skips: the ticker still has a row,
+  with a blank `skew` cell and the reason it could not be resolved. Those reasons are
+  worded more tersely than the Python script's stderr line (`no 25d call vol (2 strikes,
+  δ 0.19-0.40, seed 0.287)`), because the list renders each entry on a single line and a
+  longer one is clipped at the screen edge rather than wrapped.
 - Settings (account, watchlists, theme) and the last result are persisted on-device; there is
   no `margin-scan-config.json`. The first-launch defaults are the placeholders from
   `margin-scan-config.json.example`, so pick your account and watchlists in Settings before

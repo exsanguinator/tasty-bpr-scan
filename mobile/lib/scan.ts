@@ -1,4 +1,11 @@
 import type { ScanRow } from "./columns";
+import {
+  DEFAULT_RISK_FREE_RATE,
+  DIVIDEND_YIELD,
+  computeSkew,
+  selectSkewStrikes,
+  type SkewInputs,
+} from "./skew";
 import { get, postDryRun } from "./tastyClient";
 
 const TARGET_DTE = 45;
@@ -110,6 +117,22 @@ function roundToNickel(price: number): number {
   return Math.round(price / 0.05) * 0.05;
 }
 
+/**
+ * /margin-requirements-public-configuration needs no auth and the API docs endorse
+ * its rate as a Black-Scholes input. Falls back to a constant rather than failing
+ * the scan, since skew barely moves with a few bps of error.
+ */
+async function fetchRiskFreeRate(signal?: AbortSignal): Promise<number> {
+  try {
+    const resp = await get("/margin-requirements-public-configuration", undefined, signal);
+    const rate = parseFloat(resp.data["risk-free-rate"]);
+    if (Number.isFinite(rate)) return rate;
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+  }
+  return DEFAULT_RISK_FREE_RATE;
+}
+
 export type Account = { accountNumber: string; nickname: string };
 
 export async function fetchAccounts(signal?: AbortSignal): Promise<Account[]> {
@@ -167,6 +190,7 @@ export async function runScan({
   const kept: string[] = [];
   const ivrByTicker = new Map<string, number>();
   const ivxByTicker = new Map<string, number>();
+  const expIvsByTicker = new Map<string, Map<string, number>>();
   for (const [i, chunk] of metricChunks.entries()) {
     report("metrics", i, metricChunks.length);
     const resp = await get("/market-metrics", { symbols: chunk.join(",") }, signal);
@@ -175,6 +199,7 @@ export async function runScan({
       if (ivr != null) ivrByTicker.set(item.symbol, parseFloat(ivr));
       const ivx = item["implied-volatility-index"];
       if (ivx != null) ivxByTicker.set(item.symbol, parseFloat(ivx));
+      expIvsByTicker.set(item.symbol, expirationIvs(item));
       const rating = item["liquidity-rating"];
       if (rating != null && rating >= MIN_LIQUIDITY_RATING) {
         kept.push(item.symbol);
@@ -189,8 +214,11 @@ export async function runScan({
   report("metrics", metricChunks.length, metricChunks.length);
   tickers = kept.sort();
 
-  // Underlying quotes, 52-week ranges and previous closes.
+  // Rate for the skew's Black-Scholes inversion.
   throwIfAborted(signal);
+  const riskFreeRate = await fetchRiskFreeRate(signal);
+
+  // Underlying quotes, 52-week ranges and previous closes.
   const quoteChunks = chunked(tickers, CHUNK_SIZE);
   const underlyingMids = new Map<string, number | null>();
   const underlyingRanges = new Map<string, [number, number]>();
@@ -211,6 +239,34 @@ export async function runScan({
   }
   report("quotes", quoteChunks.length, quoteChunks.length);
 
+  /**
+   * Chooses which strikes the skew will need quotes for. Runs while the chain is
+   * already in hand, so strike selection costs no request; only the quotes do.
+   */
+  const pickSkewStrikes = (ticker: string, expiration: any, spot: number): SkewInputs | null => {
+    const date = String(expiration["expiration-date"]).slice(0, 10);
+    const seed = expIvsByTicker.get(ticker)?.get(date) || ivxByTicker.get(ticker);
+    if (!seed) {
+      skipped.push({ ticker, reason: `skew: no seed IV for ${date}` });
+      return null;
+    }
+    // Calendar time, matching the ACT/365 convention behind the ivx column.
+    const t = Math.max(expiration["days-to-expiration"], 1) / 365;
+    const { calls, puts } = selectSkewStrikes(
+      expiration.strikes,
+      spot,
+      t,
+      riskFreeRate,
+      DIVIDEND_YIELD,
+      seed,
+    );
+    if (!calls.length || !puts.length) {
+      skipped.push({ ticker, reason: "skew: too few strikes near 25 delta" });
+      return null;
+    }
+    return { ticker, calls, puts, t, riskFreeRate, seed };
+  };
+
   // Per ticker: nearest-to-45-DTE expiration, nearest OTM put strike.
   throwIfAborted(signal);
   type Candidate = {
@@ -221,6 +277,9 @@ export async function runScan({
     putSymbol: string;
     strike52wkPosition: number | null;
     chg: number | null;
+    /** Strikes to quote for the skew, chosen while the chain is in hand. */
+    skewInputs: SkewInputs | null;
+    skew: number | null;
   };
   let chainsDone = 0;
   report("chains", 0, tickers.length);
@@ -278,23 +337,64 @@ export async function runScan({
         putSymbol: strike.put,
         strike52wkPosition: range ? strikePositionIn52wkRange(strike.price, range) : null,
         chg: changeFromPrevClose(underlyingMid, prevCloses.get(ticker)),
+        skewInputs: pickSkewStrikes(ticker, expiration, underlyingMid),
+        skew: null,
       };
     },
     () => report("chains", ++chainsDone, tickers.length),
   );
   const candidates = candidateResults.filter((c): c is Candidate => c !== null);
 
-  // Option quotes for each candidate put.
+  // Option quotes: each candidate put, plus every strike the skew needs. Raw items
+  // are kept rather than mids, because the skew path demands a two-sided quote
+  // while the credit path still tolerates a `last` fallback.
   throwIfAborted(signal);
-  const optionSymbols = candidates.map((c) => c.putSymbol).sort();
+  const skewSymbols = candidates.flatMap((c) =>
+    [...(c.skewInputs?.calls ?? []), ...(c.skewInputs?.puts ?? [])].map(([, symbol]) => symbol),
+  );
+  const optionSymbols = [...new Set([...candidates.map((c) => c.putSymbol), ...skewSymbols])].sort();
   const optionChunks = chunked(optionSymbols, CHUNK_SIZE);
-  const optionMids = new Map<string, number | null>();
-  for (const [i, chunk] of optionChunks.entries()) {
-    report("option-quotes", i, optionChunks.length);
-    const resp = await get("/market-data/by-type", { "equity-option": chunk.join(",") }, signal);
-    for (const item of resp.data.items as Quote[]) optionMids.set(item.symbol, mid(item));
+  // The underlying mids above are stale by a whole chain-fetch phase, and a wrong
+  // spot moves call and put implied vol in opposite directions, landing straight on
+  // the skew. These chunks buy a spot contemporaneous with the option quotes.
+  const spotChunks = chunked(candidates.map((c) => c.ticker).sort(), CHUNK_SIZE);
+  const quoteJobs = [
+    ...optionChunks.map((chunk) => ({ param: "equity-option", chunk }) as const),
+    ...spotChunks.map((chunk) => ({ param: "equity", chunk }) as const),
+  ];
+  const optionQuotes = new Map<string, Quote>();
+  const skewSpots = new Map<string, number | null>();
+  let quoteChunksDone = 0;
+  report("option-quotes", 0, quoteJobs.length);
+  await pMap(
+    quoteJobs,
+    CONCURRENCY,
+    async ({ param, chunk }) => {
+      throwIfAborted(signal);
+      const resp = await get("/market-data/by-type", { [param]: chunk.join(",") }, signal);
+      for (const item of resp.data.items as Quote[]) {
+        if (param === "equity-option") optionQuotes.set(item.symbol, item);
+        else skewSpots.set(item.symbol, mid(item));
+      }
+    },
+    () => report("option-quotes", ++quoteChunksDone, quoteJobs.length),
+  );
+  report("option-quotes", quoteJobs.length, quoteJobs.length);
+
+  // Skew, from the quotes just fetched. A skew that cannot be resolved blanks that
+  // one cell and notes why; it never drops the row.
+  for (const c of candidates) {
+    const spot = skewSpots.get(c.ticker) ?? underlyingMids.get(c.ticker) ?? null;
+    try {
+      const { skew, messages } = computeSkew(c.skewInputs, optionQuotes, spot);
+      c.skew = skew;
+      for (const message of messages) skipped.push({ ticker: c.ticker, reason: `skew: ${message}` });
+    } catch (error) {
+      // Never let one ticker's smile kill the scan.
+      c.skew = null;
+      skipped.push({ ticker: c.ticker, reason: `skew failed: ${errorReason(error)}` });
+    }
   }
-  report("option-quotes", optionChunks.length, optionChunks.length);
 
   // Dry-run a 1-lot sell-to-open for each candidate to get its marginal BP impact.
   throwIfAborted(signal);
@@ -305,7 +405,8 @@ export async function runScan({
     CONCURRENCY,
     async (c) => {
       throwIfAborted(signal);
-      const creditMid = optionMids.get(c.putSymbol);
+      const putQuote = optionQuotes.get(c.putSymbol);
+      const creditMid = putQuote ? mid(putQuote) : null;
       if (creditMid == null) {
         skipped.push({ ticker: c.ticker, reason: "no option quote" });
         return null;
@@ -363,6 +464,7 @@ export async function runScan({
         strike: c.strike,
         strike52wkPct: c.strike52wkPosition === null ? null : c.strike52wkPosition * 100,
         chgPct: c.chg === null ? null : c.chg * 100,
+        skew: c.skew === null ? null : c.skew * 100,
         credit,
         buyingPower: marginalBp,
         creditToBpr: (credit / marginalBp) * 100,
@@ -383,6 +485,21 @@ export async function runScan({
   report("done", 1, 1);
   skipped.sort((a, b) => a.ticker.localeCompare(b.ticker));
   return { rows, skipped, ranAt: Date.now() };
+}
+
+/**
+ * Per-expiration implied volatilities from /market-metrics, keyed by YYYY-MM-DD:
+ * market-metrics can return a full timestamp where the option chain returns a
+ * plain date, so both sides are truncated to match.
+ */
+function expirationIvs(item: any): Map<string, number> {
+  const ivs = new Map<string, number>();
+  for (const entry of item["option-expiration-implied-volatilities"] ?? []) {
+    const date = entry["expiration-date"];
+    const iv = entry["implied-volatility"] == null ? NaN : parseFloat(entry["implied-volatility"]);
+    if (date && iv) ivs.set(String(date).slice(0, 10), iv);
+  }
+  return ivs;
 }
 
 /** First present of the isolated/change keys wins, as an absolute dollar amount. */

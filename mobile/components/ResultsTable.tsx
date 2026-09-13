@@ -99,7 +99,7 @@ export function ResultsTable({ rows }: { rows: ScanRow[] }) {
 
       <ScrollView style={styles.vertical}>
         <View style={styles.body}>
-          {/* Pinned ticker column: 11 more columns will not fit a phone, so the rest scroll. */}
+          {/* Pinned ticker column: 13 more columns will not fit a phone, so the rest scroll. */}
           <View>
             {sorted.map((item, index) => (
               <View

@@ -29,7 +29,7 @@ export type Theme = {
   danger: string;
   /** Danger as a filled button background; pair with `onAccent`. */
   dangerBg: string;
-  /** Sign colors for signed numeric cells (chg%); zero stays the default text color. */
+  /** Sign colors for signed numeric cells (chg%, skew); zero stays the default text color. */
   positive: string;
   negative: string;
 };
