@@ -725,6 +725,10 @@ FIELDNAMES = [
 # Columns rendered green when positive and red when negative; zero stays neutral.
 SIGNED_COLUMNS = frozenset({"chg%", "skew"})
 
+# Columns rendered red below a threshold and green above it; the threshold itself
+# stays neutral.
+THRESHOLD_COLUMNS = {"strike 52wk pct": 50.0}
+
 
 def write_csv(rows, out=sys.stdout):
     writer = csv.DictWriter(out, fieldnames=FIELDNAMES)
@@ -737,14 +741,22 @@ def write_html(rows, out=sys.stdout):
         return "" if value == "" else str(value)
 
     def cell_class(name, value):
-        """Colour the signed columns by sign; zero and blanks stay neutral."""
-        if name not in SIGNED_COLUMNS or value == "":
+        """Colour the signed columns by sign and the threshold columns by which
+        side of their cutoff they fall on; ties and blanks stay neutral."""
+        if value == "":
             return ""
-        change = float(value)
-        if change > 0:
-            return ' class="pos"'
-        if change < 0:
-            return ' class="neg"'
+        if name in SIGNED_COLUMNS:
+            change = float(value)
+            if change > 0:
+                return ' class="pos"'
+            if change < 0:
+                return ' class="neg"'
+        elif name in THRESHOLD_COLUMNS:
+            threshold = THRESHOLD_COLUMNS[name]
+            if float(value) < threshold:
+                return ' class="neg"'
+            if float(value) > threshold:
+                return ' class="pos"'
         return ""
 
     header_cells = "".join(f"<th onclick=\"sortTable({i})\">{name}</th>" for i, name in enumerate(FIELDNAMES))
