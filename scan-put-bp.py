@@ -729,6 +729,9 @@ SIGNED_COLUMNS = frozenset({"chg%", "skew"})
 # stays neutral.
 THRESHOLD_COLUMNS = {"strike 52wk pct": 50.0}
 
+# Columns rendered green above a threshold; everything else stays neutral.
+HIGHLIGHT_ABOVE_COLUMNS = {"ivr": 50.0}
+
 
 def write_csv(rows, out=sys.stdout):
     writer = csv.DictWriter(out, fieldnames=FIELDNAMES)
@@ -741,8 +744,9 @@ def write_html(rows, out=sys.stdout):
         return "" if value == "" else str(value)
 
     def cell_class(name, value):
-        """Colour the signed columns by sign and the threshold columns by which
-        side of their cutoff they fall on; ties and blanks stay neutral."""
+        """Colour the signed columns by sign, the threshold columns by which
+        side of their cutoff they fall on, and the highlight columns green above
+        theirs; ties and blanks stay neutral."""
         if value == "":
             return ""
         if name in SIGNED_COLUMNS:
@@ -756,6 +760,9 @@ def write_html(rows, out=sys.stdout):
             if float(value) < threshold:
                 return ' class="neg"'
             if float(value) > threshold:
+                return ' class="pos"'
+        elif name in HIGHLIGHT_ABOVE_COLUMNS:
+            if float(value) > HIGHLIGHT_ABOVE_COLUMNS[name]:
                 return ' class="pos"'
         return ""
 
