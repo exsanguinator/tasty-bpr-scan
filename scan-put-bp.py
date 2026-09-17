@@ -1,3 +1,4 @@
+import argparse
 import csv
 import json
 import math
@@ -11,6 +12,94 @@ import requests
 from dotenv import find_dotenv, load_dotenv
 from scipy.optimize import brentq
 from scipy.stats import norm
+
+DEFAULT_CONFIG_PATH = "margin-scan-config.json"
+
+# buying-power-effect field each --bpr-* mode reads. isolated is the order's margin
+# requirement on its own; impact is the account's actual buying-power change, which
+# nets the premium received and fees against the margin change.
+BPR_MODES = {
+    "isolated": "isolated-order-margin-requirement",
+    "impact": "change-in-buying-power",
+}
+DEFAULT_BPR_MODE = "isolated"
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="scan-put-bp.py",
+        # A typo like --htm should fail rather than silently run a full scan.
+        allow_abbrev=False,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Rank short-put candidates from your tastytrade watchlists by credit to\n"
+            "buying-power efficiency. For each liquid ticker with weekly options, picks\n"
+            "the nearest OTM put in the monthly expiration closest to 45 DTE, dry-runs\n"
+            "a 1-lot sell-to-open order, and ranks the results by `credit to bpr`."
+        ),
+        epilog=(
+            "environment:\n"
+            "  TASTY_ENV=prod is required (cert has no /market-data/by-type).\n"
+            "  TASTY_CLIENT_SECRET and TASTY_REFRESH_TOKEN are read from .env; the OAuth\n"
+            "  grant needs the trade scope, since the scan dry-runs orders.\n"
+            "\n"
+            "output:\n"
+            "  Results go to stdout, progress and errors to stderr. Tickers whose\n"
+            "  buying power is missing are kept with buying_power, credit to bpr and\n"
+            "  bpr to notional blank. Tickers whose buying power is <= 0 show it (red\n"
+            "  in HTML) with the other two blank. Both sort after the ranked rows.\n"
+            "\n"
+            "example:\n"
+            "  TASTY_ENV=prod python scan-put-bp.py --html --bpr-impact > scan.html\n"
+            "\n"
+            "See README.md for column definitions."
+        ),
+    )
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default=DEFAULT_CONFIG_PATH,
+        help=(
+            "JSON config holding account_number and watchlists "
+            f"(default: {DEFAULT_CONFIG_PATH})"
+        ),
+    )
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument(
+        "--csv", dest="output", action="store_const", const="csv",
+        help="write CSV (default)",
+    )
+    output.add_argument(
+        "--html", dest="output", action="store_const", const="html",
+        help="write a standalone HTML page with a click-to-sort table",
+    )
+    bpr = parser.add_mutually_exclusive_group()
+    bpr.add_argument(
+        "--bpr-isolated", dest="bpr_mode", action="store_const", const="isolated",
+        help=(
+            f"buying_power = {BPR_MODES['isolated']}: the margin the order needs "
+            "on its own, ignoring existing positions (default)"
+        ),
+    )
+    bpr.add_argument(
+        "--bpr-impact", dest="bpr_mode", action="store_const", const="impact",
+        help=(
+            f"buying_power = {BPR_MODES['impact']}: the account's actual "
+            "buying-power drop, net of the credit received and fees"
+        ),
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="print each ticker's raw buying-power-effect and preflight errors to stderr",
+    )
+    parser.set_defaults(output="csv", bpr_mode=DEFAULT_BPR_MODE)
+    return parser.parse_args(argv)
+
+
+# Parsed before the environment check below, so --help and bad arguments don't
+# need TASTY_ENV=prod or touch the network.
+if __name__ == "__main__":
+    ARGS = parse_args(sys.argv[1:])
 
 load_dotenv(find_dotenv())
 
@@ -640,7 +729,7 @@ def dry_run_order(account_number, put_symbol, price):
     return post_dry_run(f"/accounts/{account_number}/orders/dry-run", body)
 
 
-def extract_marginal_buying_power(resp, msgs, ticker=None, debug=False):
+def extract_marginal_buying_power(resp, msgs, ticker=None, debug=False, bpr_mode=DEFAULT_BPR_MODE):
     bpe = resp.get("data", {}).get("buying-power-effect", {})
     errors = resp.get("error", {}).get("errors", [])
 
@@ -654,32 +743,44 @@ def extract_marginal_buying_power(resp, msgs, ticker=None, debug=False):
         msgs.append(f"  {ticker}: preflight error: {hard_errors}")
         return None
 
-    for key in ("isolated-order-margin-requirement", "change-in-buying-power", "change-in-margin-requirement"):
-        if key in bpe:
-            return abs(float(bpe[key]))
-    return None
+    key = BPR_MODES[bpr_mode]
+    amount = _float_or_none(bpe.get(key))
+    if amount is None:
+        return None
+    # Amounts are unsigned with the direction in a sibling -effect field. A Credit
+    # means the order frees buying power (e.g. a credit larger than the margin it
+    # adds), so it comes back negative.
+    # The `and amount` keeps a zero Credit from printing as "-0.0".
+    amount = abs(amount)
+    return -amount if bpe.get(f"{key}-effect") == "Credit" and amount else amount
 
 
-def evaluate_candidate(account_number, candidate, credit_mid, debug=False):
-    """Dry-run one candidate's order and build its output row. Returns (row or None,
-    messages); like _build_candidate, messages are returned rather than printed."""
+def evaluate_candidate(account_number, candidate, credit_mid, debug=False, bpr_mode=DEFAULT_BPR_MODE):
+    """Dry-run one candidate's order and build its output row. Returns (row, messages);
+    like _build_candidate, messages are returned rather than printed. A row is always
+    returned: when the dry-run yields no buying power, the buying-power columns are
+    left blank, and when it yields <= 0, buying_power is shown but the ratios built
+    on it are left blank."""
     ticker = candidate["ticker"]
     msgs = [f"Dry-running {ticker} {candidate['put_symbol']}..."]
     try:
         resp = dry_run_order(account_number, candidate["put_symbol"], credit_mid)
     except requests.HTTPError:
-        msgs.append(f"  {ticker}: dry-run failed, skipping")
-        return None, msgs
-    marginal_bp = extract_marginal_buying_power(resp, msgs, ticker=ticker, debug=debug)
-    if marginal_bp is None:
-        msgs.append(f"  {ticker}: could not extract margin requirement, skipping")
-        return None, msgs
-    if marginal_bp <= 0:
-        msgs.append(
-            f"  {ticker}: dry-run shows $0 incremental margin requirement "
-            f"(account has ample buying-power cushion), skipping from ranking"
+        msgs.append(f"  {ticker}: dry-run failed, leaving buying power blank")
+        marginal_bp = None
+    else:
+        marginal_bp = extract_marginal_buying_power(
+            resp, msgs, ticker=ticker, debug=debug, bpr_mode=bpr_mode
         )
-        return None, msgs
+    if marginal_bp is None:
+        msgs.append(f"  {ticker}: no {BPR_MODES[bpr_mode]}, leaving buying power blank")
+    elif marginal_bp <= 0:
+        msgs.append(
+            f"  {ticker}: {BPR_MODES[bpr_mode]} {marginal_bp:.2f} <= 0, "
+            f"leaving credit to bpr and bpr to notional blank"
+        )
+    # Only a positive buying power makes a meaningful denominator.
+    ranked = marginal_bp is not None and marginal_bp > 0
     credit = credit_mid * 100
     notional = candidate["strike"] * 100
     row = {
@@ -697,9 +798,9 @@ def evaluate_candidate(account_number, candidate, credit_mid, debug=False):
         "chg%": f"{candidate['chg'] * 100:.2f}" if candidate["chg"] is not None else "",
         "skew": f"{candidate['skew'] * 100:.1f}" if candidate.get("skew") is not None else "",
         "credit": f"{credit:.1f}",
-        "buying_power": f"{marginal_bp:.1f}",
-        "credit to bpr": f"{credit / marginal_bp * 100:.1f}",
-        "bpr to notional": f"{marginal_bp / notional * 100:.1f}",
+        "buying_power": f"{marginal_bp:.1f}" if marginal_bp is not None else "",
+        "credit to bpr": f"{credit / marginal_bp * 100:.1f}" if ranked else "",
+        "bpr to notional": f"{marginal_bp / notional * 100:.1f}" if ranked else "",
         "credit to notional": f"{credit / notional * 100:.1f}",
     }
     return row, msgs
@@ -732,6 +833,9 @@ THRESHOLD_COLUMNS = {"strike 52wk pct": 50.0}
 # Columns rendered green above a threshold; everything else stays neutral.
 HIGHLIGHT_ABOVE_COLUMNS = {"ivr": 50.0}
 
+# Columns rendered red at or below zero; everything else stays neutral.
+NONPOSITIVE_RED_COLUMNS = frozenset({"buying_power"})
+
 
 def write_csv(rows, out=sys.stdout):
     writer = csv.DictWriter(out, fieldnames=FIELDNAMES)
@@ -745,8 +849,9 @@ def write_html(rows, out=sys.stdout):
 
     def cell_class(name, value):
         """Colour the signed columns by sign, the threshold columns by which
-        side of their cutoff they fall on, and the highlight columns green above
-        theirs; ties and blanks stay neutral."""
+        side of their cutoff they fall on, the highlight columns green above
+        theirs, and the nonpositive columns red at or below zero; ties and blanks
+        stay neutral."""
         if value == "":
             return ""
         if name in SIGNED_COLUMNS:
@@ -764,6 +869,9 @@ def write_html(rows, out=sys.stdout):
         elif name in HIGHLIGHT_ABOVE_COLUMNS:
             if float(value) > HIGHLIGHT_ABOVE_COLUMNS[name]:
                 return ' class="pos"'
+        elif name in NONPOSITIVE_RED_COLUMNS:
+            if float(value) <= 0:
+                return ' class="neg"'
         return ""
 
     header_cells = "".join(f"<th onclick=\"sortTable({i})\">{name}</th>" for i, name in enumerate(FIELDNAMES))
@@ -842,9 +950,9 @@ function sortTable(colIndex) {{
 
 
 if __name__ == "__main__":
-    positional_args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    config_path = positional_args[0] if positional_args else "margin-scan-config.json"
-    config = load_config(config_path)
+    bpr_mode = ARGS.bpr_mode
+    print(f"Buying power: --bpr-{bpr_mode} ({BPR_MODES[bpr_mode]})", file=sys.stderr)
+    config = load_config(ARGS.config)
     account_number = config["account_number"]
     watchlist_names = config["watchlists"]
 
@@ -873,7 +981,7 @@ if __name__ == "__main__":
     # the skew. Two requests buys a spot contemporaneous with the option quotes.
     skew_spots, _ = fetch_equity_mids({c["ticker"] for c in candidates})
 
-    debug = "--debug" in sys.argv
+    debug = ARGS.debug
     pending = []
     for c in candidates:
         quote = quotes.get(c["put_symbol"])
@@ -893,18 +1001,22 @@ if __name__ == "__main__":
     rows = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         results = pool.map(
-            lambda item: evaluate_candidate(account_number, item[0], item[1], debug),
+            lambda item: evaluate_candidate(account_number, item[0], item[1], debug, bpr_mode),
             pending,
         )
         for row, msgs in results:
             for msg in msgs:
                 print(msg, file=sys.stderr)
-            if row is not None:
-                rows.append(row)
+            rows.append(row)
 
-    rows.sort(key=lambda r: float(r["credit to bpr"]), reverse=True)
+    # Rows with a blank credit to bpr sort after every ranked row. The sort is stable,
+    # so they keep ticker order among themselves.
+    rows.sort(
+        key=lambda r: (r["credit to bpr"] != "", float(r["credit to bpr"] or 0)),
+        reverse=True,
+    )
 
-    if "--html" in sys.argv:
+    if ARGS.output == "html":
         write_html(rows)
     else:
         write_csv(rows)
