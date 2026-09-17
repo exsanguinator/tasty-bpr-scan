@@ -111,7 +111,7 @@ BASE_URLS = {
 if _ENV not in BASE_URLS:
     raise ValueError(f"Unknown TASTY_ENV '{_ENV}'. Choose from: {', '.join(BASE_URLS)}")
 BASE_URL = BASE_URLS[_ENV]
-USER_AGENT = "tasty-sandbox/1.0"
+USER_AGENT = "tasty-bpr-scan/1.0"
 
 if _ENV != "prod":
     print(

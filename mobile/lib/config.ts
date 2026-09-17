@@ -3,7 +3,7 @@ export const BASE_URLS = {
   cert: "https://api.cert.tastyworks.com",
 } as const;
 
-export const USER_AGENT = "tasty-sandbox/1.0";
+export const USER_AGENT = "tasty-bpr-scan/1.0";
 
 export type AppConfig = {
   env: string;

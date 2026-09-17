@@ -1,0 +1,13 @@
+.venv/
+.env
+__pycache__/
+*~
+CLAUDE.local.md
+margin-scan-config.json
+
+# Expo app
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+mobile/android/
+mobile/ios/
