@@ -9,10 +9,14 @@ export type ScanRow = {
   chgPct: number | null;
   /** Estimated premium for 1 contract, in dollars. */
   credit: number;
-  /** Marginal buying-power requirement this order adds, from the dry-run. */
-  buyingPower: number;
-  creditToBpr: number;
-  bprToNotional: number;
+  /**
+   * Buying power this order consumes, from the dry-run field the BPR setting
+   * selects. Null when the dry-run yields none; may be <= 0 when the order frees
+   * buying power, in which case the two ratios below are null.
+   */
+  buyingPower: number | null;
+  creditToBpr: number | null;
+  bprToNotional: number | null;
   creditToNotional: number;
   ivr: number | null;
   ivx: number | null;
@@ -30,6 +34,12 @@ export type Column = {
   numeric: boolean;
   /** Render the value green when positive, red when negative, plain at zero. */
   signed?: boolean;
+  /** Render the value red at or below zero, plain otherwise. */
+  nonpositiveRed?: boolean;
+  /** Render the value red below this cutoff, green above it, plain at it. */
+  threshold?: number;
+  /** Render the value green above this cutoff, plain otherwise. */
+  highlightAbove?: number;
   format: (row: ScanRow) => string;
 };
 
@@ -48,7 +58,14 @@ export const COLUMNS: Column[] = [
   { key: "expiration", label: "expiration", width: 92, numeric: false, format: (r) => r.expiration },
   { key: "dte", label: "dte", width: 46, numeric: true, format: (r) => String(r.dte) },
   { key: "strike", label: "strike", width: 66, numeric: true, format: (r) => String(r.strike) },
-  { key: "strike52wkPct", label: "52wk %", width: 74, numeric: true, format: (r) => oneDecimal(r.strike52wkPct) },
+  {
+    key: "strike52wkPct",
+    label: "52wk %",
+    width: 74,
+    numeric: true,
+    threshold: 50,
+    format: (r) => oneDecimal(r.strike52wkPct),
+  },
   {
     key: "chgPct",
     label: "chg%",
@@ -58,11 +75,25 @@ export const COLUMNS: Column[] = [
     format: (r) => twoDecimal(r.chgPct),
   },
   { key: "credit", label: "credit", width: 66, numeric: true, format: (r) => oneDecimal(r.credit) },
-  { key: "buyingPower", label: "bpr", width: 78, numeric: true, format: (r) => oneDecimal(r.buyingPower) },
+  {
+    key: "buyingPower",
+    label: "bpr",
+    width: 78,
+    numeric: true,
+    nonpositiveRed: true,
+    format: (r) => oneDecimal(r.buyingPower),
+  },
   { key: "creditToBpr", label: "cr/bpr", width: 72, numeric: true, format: (r) => oneDecimal(r.creditToBpr) },
   { key: "bprToNotional", label: "bpr/ntl", width: 76, numeric: true, format: (r) => oneDecimal(r.bprToNotional) },
   { key: "creditToNotional", label: "cr/ntl", width: 72, numeric: true, format: (r) => oneDecimal(r.creditToNotional) },
-  { key: "ivr", label: "ivr", width: 58, numeric: true, format: (r) => oneDecimal(r.ivr) },
+  {
+    key: "ivr",
+    label: "ivr",
+    width: 58,
+    numeric: true,
+    highlightAbove: 50,
+    format: (r) => oneDecimal(r.ivr),
+  },
   { key: "ivx", label: "ivx", width: 58, numeric: true, format: (r) => oneDecimal(r.ivx) },
   {
     key: "skew",

@@ -153,12 +153,29 @@ export function ResultsTable({ rows }: { rows: ScanRow[] }) {
   );
 }
 
-/** Green above zero, red below; zero and blanks keep the default text color. */
+/**
+ * Mirrors cell_class() in scan-put-bp.py's HTML output. Signed columns: green above
+ * zero, red below. Threshold columns: red below the cutoff, green above. Highlight
+ * columns: green above the cutoff. Nonpositive columns: red at or below zero. Ties
+ * and blanks keep the default text color.
+ *
+ * Compares the displayed value rather than the raw one, as the Python script
+ * does, so a cell reading "50.0" or "-0.0" is never colored as if it were past
+ * the cutoff.
+ */
 function signStyle(column: Column, row: ScanRow, theme: Theme) {
-  if (!column.signed) return null;
-  const value = row[column.key];
-  if (typeof value !== "number" || value === 0) return null;
-  return { color: value > 0 ? theme.positive : theme.negative };
+  if (typeof row[column.key] !== "number") return null;
+  const value = parseFloat(column.format(row));
+  if (!Number.isFinite(value)) return null;
+  const positive = { color: theme.positive };
+  const negative = { color: theme.negative };
+  if (column.signed) return value > 0 ? positive : value < 0 ? negative : null;
+  if (column.threshold !== undefined) {
+    return value > column.threshold ? positive : value < column.threshold ? negative : null;
+  }
+  if (column.highlightAbove !== undefined) return value > column.highlightAbove ? positive : null;
+  if (column.nonpositiveRed) return value <= 0 ? negative : null;
+  return null;
 }
 
 const createStyles = (theme: Theme) =>

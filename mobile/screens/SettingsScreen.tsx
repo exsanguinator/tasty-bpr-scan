@@ -9,7 +9,14 @@ import {
   View,
 } from "react-native";
 
-import { fetchAccounts, fetchWatchlists, type Account, type Watchlist } from "../lib/scan";
+import {
+  BPR_MODES,
+  fetchAccounts,
+  fetchWatchlists,
+  type Account,
+  type BprMode,
+  type Watchlist,
+} from "../lib/scan";
 import {
   THEME_MODES,
   THEME_MODE_LABELS,
@@ -18,6 +25,11 @@ import {
   type ThemeMode,
 } from "../lib/theme";
 import type { Settings } from "../lib/storage";
+
+const BPR_MODE_DESCRIPTIONS: Record<BprMode, string> = {
+  isolated: "Margin the order needs on its own (default)",
+  impact: "Account's actual buying-power drop, net of credit and fees",
+};
 
 type Props = {
   settings: Settings;
@@ -89,6 +101,28 @@ export function SettingsScreen({ settings, onChange }: Props) {
               {mode === "system" ? (
                 <Text style={styles.rowSub}>Follow the device setting</Text>
               ) : null}
+            </View>
+          </Pressable>
+        );
+      })}
+
+      {/* Above the account and watchlists for the same reason as Theme. */}
+      <Text style={styles.sectionHeader}>BPR</Text>
+      {(Object.keys(BPR_MODES) as BprMode[]).map((mode) => {
+        const selected = mode === settings.bprMode;
+        return (
+          <Pressable
+            key={mode}
+            style={styles.row}
+            onPress={() => onChange({ ...settings, bprMode: mode })}
+          >
+            <Text style={[styles.marker, selected && styles.markerSelected]}>
+              {selected ? "\u25cf" : "\u25cb"}
+            </Text>
+            <View style={styles.rowText}>
+              <Text style={styles.rowLabel}>{mode}</Text>
+              <Text style={styles.rowSub}>{BPR_MODE_DESCRIPTIONS[mode]}</Text>
+              <Text style={styles.rowSub}>{BPR_MODES[mode]}</Text>
             </View>
           </Pressable>
         );

@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import type { ScanRow } from "./columns";
-import type { ScanResult, Skipped } from "./scan";
+import { BPR_MODES, DEFAULT_BPR_MODE, type BprMode, type ScanResult, type Skipped } from "./scan";
 import { THEME_MODES, type ThemeMode } from "./theme";
 
 const SETTINGS_KEY = "settings.v1";
@@ -11,6 +11,8 @@ export type Settings = {
   accountNumber: string | null;
   watchlists: string[];
   themeMode: ThemeMode;
+  /** Which dry-run field becomes bpr; see BPR_MODES in scan.ts. */
+  bprMode: BprMode;
 };
 
 /**
@@ -19,6 +21,7 @@ export type Settings = {
  */
 export const DEFAULT_SETTINGS: Settings = {
   themeMode: "system",
+  bprMode: DEFAULT_BPR_MODE,
   accountNumber: "XXXXXXXXX",
   watchlists: ["My Watchlist 1", "My Watchlist 2"],
 };
@@ -36,6 +39,8 @@ export async function loadSettings(): Promise<Settings> {
         parsed.themeMode && THEME_MODES.includes(parsed.themeMode)
           ? parsed.themeMode
           : "system",
+      // Likewise for a blob written before bprMode existed.
+      bprMode: parsed.bprMode && parsed.bprMode in BPR_MODES ? parsed.bprMode : DEFAULT_BPR_MODE,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -54,9 +59,15 @@ export async function loadLastResult(): Promise<ScanResult | null> {
       rows?: ScanRow[];
       skipped?: Skipped[];
       ranAt?: number;
+      bprMode?: BprMode;
     };
     if (!parsed.rows) return null;
-    return { rows: parsed.rows, skipped: parsed.skipped ?? [], ranAt: parsed.ranAt ?? 0 };
+    return {
+      rows: parsed.rows,
+      skipped: parsed.skipped ?? [],
+      ranAt: parsed.ranAt ?? 0,
+      bprMode: parsed.bprMode,
+    };
   } catch {
     return null;
   }

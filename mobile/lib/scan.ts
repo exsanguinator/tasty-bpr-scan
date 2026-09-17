@@ -36,11 +36,32 @@ export const PHASE_LABELS: Record<ScanPhase, string> = {
 
 export type Progress = { phase: ScanPhase; done: number; total: number };
 export type Skipped = { ticker: string; reason: string };
-export type ScanResult = { rows: ScanRow[]; skipped: Skipped[]; ranAt: number };
+
+/**
+ * buying-power-effect field each BPR mode reads, matching scan-put-bp.py's
+ * --bpr-isolated / --bpr-impact. isolated is the order's margin requirement on its
+ * own; impact is the account's actual buying-power change, which nets the premium
+ * received and fees against the margin change.
+ */
+export const BPR_MODES = {
+  isolated: "isolated-order-margin-requirement",
+  impact: "change-in-buying-power",
+} as const;
+export type BprMode = keyof typeof BPR_MODES;
+export const DEFAULT_BPR_MODE: BprMode = "isolated";
+
+export type ScanResult = {
+  rows: ScanRow[];
+  skipped: Skipped[];
+  ranAt: number;
+  /** Absent on a result cached by a build that predates the setting. */
+  bprMode?: BprMode;
+};
 
 export type ScanOptions = {
   accountNumber: string;
   watchlists: string[];
+  bprMode?: BprMode;
   onProgress?: (progress: Progress) => void;
   signal?: AbortSignal;
 };
@@ -173,6 +194,7 @@ async function resolveTickers(watchlistNames: string[], signal?: AbortSignal): P
 export async function runScan({
   accountNumber,
   watchlists,
+  bprMode = DEFAULT_BPR_MODE,
   onProgress,
   signal,
 }: ScanOptions): Promise<ScanResult> {
@@ -411,9 +433,14 @@ export async function runScan({
         skipped.push({ ticker: c.ticker, reason: "no option quote" });
         return null;
       }
-      let resp;
+      // Every candidate with a credit gets a row. When the dry-run yields no
+      // buying power the buying-power columns are blank, and when it yields <= 0,
+      // bpr is shown but the ratios built on it are blank. The `bpr:` entries in
+      // skipped are notes on those cells, like the `skew:` ones, not skips.
+      const field = BPR_MODES[bprMode];
+      let marginalBp: number | null = null;
       try {
-        resp = await postDryRun(
+        const resp = await postDryRun(
           `/accounts/${accountNumber}/orders/dry-run`,
           {
             "order-type": "Limit",
@@ -431,30 +458,25 @@ export async function runScan({
           },
           signal,
         );
+        marginalBp = extractMarginalBuyingPower(resp, bprMode);
+        if (marginalBp === null) {
+          const errors = resp?.error?.errors ?? [];
+          const hard = errors.filter((e: any) => e.code !== "margin_check_failed");
+          skipped.push({
+            ticker: c.ticker,
+            reason: hard.length
+              ? `bpr: preflight error: ${hard.map((e: any) => e.message ?? e.code).join("; ")}`
+              : `bpr: no ${field}`,
+          });
+        } else if (marginalBp <= 0) {
+          skipped.push({ ticker: c.ticker, reason: `bpr: ${field} ${marginalBp.toFixed(2)} <= 0` });
+        }
       } catch (error) {
         if (isAbortError(error)) throw error;
-        skipped.push({ ticker: c.ticker, reason: `dry-run failed: ${errorReason(error)}` });
-        return null;
+        skipped.push({ ticker: c.ticker, reason: `bpr: dry-run failed: ${errorReason(error)}` });
       }
-      const marginalBp = extractMarginalBuyingPower(resp);
-      if (marginalBp === null) {
-        const errors = resp?.error?.errors ?? [];
-        const hard = errors.filter((e: any) => e.code !== "margin_check_failed");
-        skipped.push({
-          ticker: c.ticker,
-          reason: hard.length
-            ? `preflight error: ${hard.map((e: any) => e.message ?? e.code).join("; ")}`
-            : "could not extract margin requirement",
-        });
-        return null;
-      }
-      if (marginalBp <= 0) {
-        skipped.push({
-          ticker: c.ticker,
-          reason: "$0 incremental margin requirement (ample buying-power cushion)",
-        });
-        return null;
-      }
+      // Only a positive buying power makes a meaningful denominator.
+      const ranked = marginalBp !== null && marginalBp > 0;
       const credit = creditMid * 100;
       const notional = c.strike * 100;
       return {
@@ -467,8 +489,8 @@ export async function runScan({
         skew: c.skew === null ? null : c.skew * 100,
         credit,
         buyingPower: marginalBp,
-        creditToBpr: (credit / marginalBp) * 100,
-        bprToNotional: (marginalBp / notional) * 100,
+        creditToBpr: ranked ? (credit / marginalBp!) * 100 : null,
+        bprToNotional: ranked ? (marginalBp! / notional) * 100 : null,
         creditToNotional: (credit / notional) * 100,
         ivr: ivrByTicker.has(c.ticker) ? ivrByTicker.get(c.ticker)! * 100 : null,
         ivx: ivxByTicker.has(c.ticker) ? ivxByTicker.get(c.ticker)! * 100 : null,
@@ -478,13 +500,20 @@ export async function runScan({
     () => report("dry-runs", ++dryRunsDone, candidates.length),
   );
 
+  // Rows with a blank creditToBpr sort after every ranked row; the sort is stable,
+  // so they keep ticker order among themselves.
   const rows = rowResults
     .filter((r): r is ScanRow => r !== null)
-    .sort((a, b) => b.creditToBpr - a.creditToBpr);
+    .sort((a, b) => {
+      if (a.creditToBpr === null || b.creditToBpr === null) {
+        return (a.creditToBpr === null ? 1 : 0) - (b.creditToBpr === null ? 1 : 0);
+      }
+      return b.creditToBpr - a.creditToBpr;
+    });
 
   report("done", 1, 1);
   skipped.sort((a, b) => a.ticker.localeCompare(b.ticker));
-  return { rows, skipped, ranAt: Date.now() };
+  return { rows, skipped, ranAt: Date.now(), bprMode };
 }
 
 /**
@@ -502,15 +531,19 @@ function expirationIvs(item: any): Map<string, number> {
   return ivs;
 }
 
-/** First present of the isolated/change keys wins, as an absolute dollar amount. */
-function extractMarginalBuyingPower(resp: any): number | null {
+/**
+ * The selected mode's field, signed. Amounts are unsigned with the direction in a
+ * sibling -effect field; a Credit means the order frees buying power (e.g. a
+ * credit larger than the margin it adds), so it comes back negative.
+ */
+export function extractMarginalBuyingPower(resp: any, bprMode: BprMode): number | null {
   const bpe = resp?.data?.["buying-power-effect"] ?? {};
-  for (const key of [
-    "isolated-order-margin-requirement",
-    "change-in-buying-power",
-    "change-in-margin-requirement",
-  ]) {
-    if (key in bpe) return Math.abs(parseFloat(bpe[key]));
-  }
-  return null;
+  const errors: any[] = resp?.error?.errors ?? [];
+  const hard = errors.filter((e) => e.code !== "margin_check_failed");
+  if (hard.length && Object.keys(bpe).length === 0) return null;
+  const key = BPR_MODES[bprMode];
+  const amount = bpe[key] == null ? NaN : Math.abs(parseFloat(bpe[key]));
+  if (!Number.isFinite(amount)) return null;
+  // The `&& amount` keeps a zero Credit from becoming -0.
+  return bpe[`${key}-effect`] === "Credit" && amount ? -amount : amount;
 }

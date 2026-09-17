@@ -46,6 +46,7 @@ export function ResultsScreen({ settings }: { settings: Settings }) {
       const next = await runScan({
         accountNumber: settings.accountNumber!,
         watchlists: settings.watchlists,
+        bprMode: settings.bprMode,
         onProgress: setProgress,
         signal: controller.signal,
       });
@@ -84,7 +85,10 @@ export function ResultsScreen({ settings }: { settings: Settings }) {
           ) : (
             <Text style={styles.statusText}>
               {result
-                ? `${result.rows.length} rows · ${formatRanAt(result.ranAt)}`
+                ? // The mode the cached result was scanned with, which can differ
+                  // from the current setting until the next refresh.
+                  `${result.rows.length} rows · ${formatRanAt(result.ranAt)}` +
+                  (result.bprMode ? ` · bpr ${result.bprMode}` : "")
                 : canRun
                   ? "No results yet."
                   : "Pick an account and at least one watchlist in Settings."}

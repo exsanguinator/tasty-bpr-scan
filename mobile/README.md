@@ -22,11 +22,12 @@ and surfaced through `expo-constants`. `TASTY_ENV` must be `prod`: the scan depe
 
 ```bash
 npm install
-npm run scan -- <account-number> "My Watchlist 1" "My Watchlist 2"
+npm run scan -- [--bpr-isolated|--bpr-impact] <account-number> "My Watchlist 1" "My Watchlist 2"
 ```
 
 It prints the same CSV columns to stdout and skip reasons to stderr, so the output can
-be diffed against `TASTY_ENV=prod python ../scan-put-bp.py`.
+be diffed against `TASTY_ENV=prod python ../scan-put-bp.py` run with the same `--bpr-*`
+flag (both default to `--bpr-isolated`).
 
 ```bash
 npm run typecheck
@@ -68,7 +69,7 @@ but that needs this Mac serving the bundle.
 | `lib/skew.ts` | 25-delta skew: strike selection, vol inversion, interpolation |
 | `lib/blackscholes.ts` | Normal CDF/PDF/quantile, Brent root-finder, Black-Scholes |
 | `lib/columns.ts` | Column definitions, formatters, numeric sort |
-| `lib/storage.ts` | AsyncStorage: settings and last scan result |
+| `lib/storage.ts` | AsyncStorage: settings (account, watchlists, theme, BPR) and last scan result |
 | `lib/theme.ts` | Light/dark palettes, `ThemeProvider`, `useTheme()` |
 | `components/ResultsTable.tsx` | Sortable table, pinned ticker column and header row |
 | `screens/` | Results and Settings screens |
@@ -86,15 +87,27 @@ but that needs this Mac serving the bundle.
   the printed decimal.
 - Rows hold raw numbers and are formatted at render time, so table columns sort
   numerically rather than lexically.
-- `chg%` and `skew` are colored green when positive and red when negative (zero and
-  blanks keep the default text color); the CSV from `scan-put-bp.py` is plain text.
+- Cells are colored as in `scan-put-bp.py`'s HTML output (the CSV is plain text):
+  `chg%` and `skew` green when positive and red when negative; `52wk %` red below 50
+  and green above; `ivr` green above 50; `bpr` red at or below zero. Ties and blanks keep
+  the default text color, and the comparison uses the displayed value (so `50.0` or
+  `-0.0` stays uncolored), as the HTML does.
+- The **BPR** setting picks which dry-run field becomes `bpr`, like the Python script's
+  `--bpr-isolated` (default, `isolated-order-margin-requirement`) and `--bpr-impact`
+  (`change-in-buying-power`, which already nets out the credit received). The status line
+  shows the mode the displayed result was scanned with, since changing the setting only
+  takes effect on the next Refresh. As in the Python script, a ticker whose dry-run fails
+  or lacks that field keeps its row with `bpr`, `cr/bpr` and `bpr/ntl` blank, and one
+  whose `bpr` is `<= 0` shows it with `cr/bpr` and `bpr/ntl` blank; both sort after the
+  ranked rows.
 - Skipped tickers and their reasons appear in a collapsible "Skipped" section instead of
-  going to stderr. The `skew:` entries there are not skips: the ticker still has a row,
-  with a blank `skew` cell and the reason it could not be resolved. Those reasons are
+  going to stderr. The `skew:` and `bpr:` entries there are not skips: the ticker still
+  has a row, and the entry explains the blank `skew` cell or the blank or `<= 0`
+  buying-power cells. Those reasons are
   worded more tersely than the Python script's stderr line (`no 25d call vol (2 strikes,
   δ 0.19-0.40, seed 0.287)`), because the list renders each entry on a single line and a
   longer one is clipped at the screen edge rather than wrapped.
-- Settings (account, watchlists, theme) and the last result are persisted on-device; there is
+- Settings (account, watchlists, theme, BPR) and the last result are persisted on-device; there is
   no `margin-scan-config.json`. The first-launch defaults are the placeholders from
   `margin-scan-config.json.example`, so pick your account and watchlists in Settings before
   the first scan.
