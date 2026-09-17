@@ -180,3 +180,9 @@ same scan on an Android phone with no backend: a Settings screen for picking the
 watchlists and BPR mode, and an on-screen sortable results table. Credentials are baked
 into the build from this repo's `.env`. See [mobile/README.md](mobile/README.md) for the
 build and sideload instructions.
+
+## Screenshot
+
+Sample HTML output screenshot of a REG-T margin account.
+
+<img width="1109" height="567" alt="image" src="https://github.com/user-attachments/assets/d6f846ab-2245-423d-86f7-25d0a6619d92" />
