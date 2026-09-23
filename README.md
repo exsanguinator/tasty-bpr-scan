@@ -27,7 +27,7 @@ Split out of `tasty-sandbox`, with the scanner's git history intact.
 3. **Configure credentials and the scan**
    ```bash
    cp .env.example .env
-   # edit .env with your client secret and refresh token
+   # edit .env with your client secret and refresh token (and Netlify token, to publish)
    cp margin-scan-config.json.example margin-scan-config.json
    # edit margin-scan-config.json with your account number and watchlist names
    ```
@@ -49,7 +49,9 @@ nearest-to-45-DTE monthly expiration's nearest OTM put strike, dry-runs a
 1-lot sell-to-open order via `POST /accounts/{account_number}/orders/dry-run`,
 and writes the results ranked by `credit to bpr` (see column definitions below).
 Output is CSV to stdout by default, or `--csv` explicitly; pass `--html` to
-instead write a standalone HTML page with a click-to-sort results table. Pass
+instead write a standalone HTML page with a click-to-sort results table, followed by
+the date and time the page was generated and an `Export to CSV` button that
+downloads the table in its current sort order. Pass
 `--debug` to print each ticker's raw `buying-power-effect` and any preflight
 errors to stderr. Pass `-h`/`--help` for a summary of all arguments and their
 defaults; it works without `TASTY_ENV=prod` and makes no API calls. Unknown or
@@ -167,6 +169,31 @@ Passing both flags is an error.
   too far from 25 delta is left blank rather than guessed at, with the
   reason on stderr. Treat `skew` as a comparative screening number across
   tickers, not as an absolute value or a substitute for a broker greek.
+
+## Publishing to Netlify
+
+`publish-netlify.py` deploys HTML files to a Netlify site through the Netlify API:
+
+```bash
+python publish-netlify.py scan.html                  # → https://<site>/scan.html
+python publish-netlify.py scan.html --as index.html  # publish as the site's home page
+python publish-netlify.py scan-*.html                # several files in one deploy
+python publish-netlify.py scan.html --replace        # drop everything else on the site
+```
+
+It needs a personal access token (Netlify > User settings > Applications > Personal
+access tokens) in `.env` as `NETLIFY_AUTH_TOKEN`. The target site defaults to
+`cosmic-palmier-7dd8d7.netlify.app`; override it with `--site` or `NETLIFY_SITE_ID`.
+Netlify deploys are full snapshots, so the script starts from the site's current file
+list and pages published earlier stay up unless `--replace` is given. It prints each
+published URL once the deploy is live.
+
+`sh-regt.sh` runs the whole pipeline: it scans the watchlists in
+`margin-scan-config-regt.json` (create it from `margin-scan-config.json.example`, like
+the default config) with `--html --bpr-isolated`, and publishes the result as the
+site's `index.html`. The scan is written to a temp file and moved into place only on
+success, so a failed scan stops the script without replacing the live page. It can be
+run from any directory, e.g. from cron.
 
 ## Notes
 

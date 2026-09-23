@@ -1,5 +1,6 @@
 import argparse
 import csv
+import html
 import json
 import math
 import os
@@ -7,6 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import requests
 from dotenv import find_dotenv, load_dotenv
@@ -843,7 +845,11 @@ def write_csv(rows, out=sys.stdout):
     writer.writerows(rows)
 
 
-def write_html(rows, out=sys.stdout):
+def write_html(rows, out=sys.stdout, generated_at=None):
+    generated_at = generated_at or datetime.now().astimezone()
+    generated_label = html.escape(generated_at.strftime("%Y-%m-%d %H:%M:%S %Z"))
+    csv_filename = f"scan-put-bp-{generated_at.strftime('%Y%m%d-%H%M%S')}.csv"
+
     def cell(value):
         return "" if value == "" else str(value)
 
@@ -905,6 +911,15 @@ def write_html(rows, out=sys.stdout):
   th.desc::after {{ content: " \\25BC"; }}
   td.pos {{ color: #5fd894; }}
   td.neg {{ color: #ff9a90; }}
+  footer {{
+    margin-top: 12px; color: #9aa1a9;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+  }}
+  button {{
+    font: inherit; color: #e7e9ec; background: #21262c;
+    border: 1px solid #2c3138; border-radius: 4px; padding: 6px 12px; cursor: pointer;
+  }}
+  button:hover {{ background: #2c3138; }}
 </style>
 </head>
 <body>
@@ -914,6 +929,10 @@ def write_html(rows, out=sys.stdout):
 {body_rows}
 </tbody>
 </table>
+<footer>
+  <div>Generated {generated_label}</div>
+  <button type="button" onclick="exportCsv()">Export to CSV</button>
+</footer>
 <script>
 let sortState = {{}};
 function sortTable(colIndex) {{
@@ -942,6 +961,24 @@ function sortTable(colIndex) {{
 
   for (const th of table.tHead.rows[0].cells) th.classList.remove("asc", "desc");
   table.tHead.rows[0].cells[colIndex].classList.add(ascending ? "asc" : "desc");
+}}
+
+// Exports the table in its current sort order. textContent rather than innerText
+// so the header's sort arrows (CSS ::after content) never leak into the file.
+function exportCsv() {{
+  const quote = (text) => /[",\\r\\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+  const table = document.getElementById("results");
+  const lines = Array.from(table.rows, (row) =>
+    Array.from(row.cells, (cell) => quote(cell.textContent)).join(",")
+  );
+  const blob = new Blob([lines.join("\\r\\n") + "\\r\\n"], {{ type: "text/csv" }});
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = {json.dumps(csv_filename)};
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(link.href);
 }}
 </script>
 </body>

@@ -4,6 +4,7 @@ __pycache__/
 *~
 CLAUDE.local.md
 margin-scan-config.json
+margin-scan-config-regt.json
 
 # Expo app
 mobile/node_modules/
@@ -11,3 +12,6 @@ mobile/.expo/
 mobile/dist/
 mobile/android/
 mobile/ios/
+
+# sh-*.sh output
+output-*.html
