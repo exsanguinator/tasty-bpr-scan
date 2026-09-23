@@ -37,7 +37,7 @@ def parse_args(argv):
             "Rank short-put candidates from your tastytrade watchlists by credit to\n"
             "buying-power efficiency. For each liquid ticker with weekly options, picks\n"
             "the nearest OTM put in the monthly expiration closest to 45 DTE, dry-runs\n"
-            "a 1-lot sell-to-open order, and ranks the results by `credit to bpr`."
+            "a 1-lot sell-to-open order, and ranks the results by `cr/bpr`."
         ),
         epilog=(
             "environment:\n"
@@ -47,8 +47,8 @@ def parse_args(argv):
             "\n"
             "output:\n"
             "  Results go to stdout, progress and errors to stderr. Tickers whose\n"
-            "  buying power is missing are kept with buying_power, credit to bpr and\n"
-            "  bpr to notional blank. Tickers whose buying power is <= 0 show it (red\n"
+            "  buying power is missing are kept with bpr, cr/bpr and\n"
+            "  bpr/ntl blank. Tickers whose buying power is <= 0 show it (red\n"
             "  in HTML) with the other two blank. Both sort after the ranked rows.\n"
             "\n"
             "example:\n"
@@ -79,14 +79,14 @@ def parse_args(argv):
     bpr.add_argument(
         "--bpr-isolated", dest="bpr_mode", action="store_const", const="isolated",
         help=(
-            f"buying_power = {BPR_MODES['isolated']}: the margin the order needs "
+            f"bpr = {BPR_MODES['isolated']}: the margin the order needs "
             "on its own, ignoring existing positions (default)"
         ),
     )
     bpr.add_argument(
         "--bpr-impact", dest="bpr_mode", action="store_const", const="impact",
         help=(
-            f"buying_power = {BPR_MODES['impact']}: the account's actual "
+            f"bpr = {BPR_MODES['impact']}: the account's actual "
             "buying-power drop, net of the credit received and fees"
         ),
     )
@@ -761,7 +761,7 @@ def evaluate_candidate(account_number, candidate, credit_mid, debug=False, bpr_m
     """Dry-run one candidate's order and build its output row. Returns (row, messages);
     like _build_candidate, messages are returned rather than printed. A row is always
     returned: when the dry-run yields no buying power, the buying-power columns are
-    left blank, and when it yields <= 0, buying_power is shown but the ratios built
+    left blank, and when it yields <= 0, bpr is shown but the ratios built
     on it are left blank."""
     ticker = candidate["ticker"]
     msgs = [f"Dry-running {ticker} {candidate['put_symbol']}..."]
@@ -779,7 +779,7 @@ def evaluate_candidate(account_number, candidate, credit_mid, debug=False, bpr_m
     elif marginal_bp <= 0:
         msgs.append(
             f"  {ticker}: {BPR_MODES[bpr_mode]} {marginal_bp:.2f} <= 0, "
-            f"leaving credit to bpr and bpr to notional blank"
+            f"leaving cr/bpr and bpr/ntl blank"
         )
     # Only a positive buying power makes a meaningful denominator.
     ranked = marginal_bp is not None and marginal_bp > 0
@@ -792,7 +792,7 @@ def evaluate_candidate(account_number, candidate, credit_mid, debug=False, bpr_m
         "expiration": candidate["expiration"],
         "dte": candidate["dte"],
         "strike": candidate["strike"],
-        "strike 52wk pct": (
+        "52wk%": (
             f"{candidate['strike_52wk_position'] * 100:.1f}"
             if candidate["strike_52wk_position"] is not None
             else ""
@@ -800,10 +800,10 @@ def evaluate_candidate(account_number, candidate, credit_mid, debug=False, bpr_m
         "chg%": f"{candidate['chg'] * 100:.2f}" if candidate["chg"] is not None else "",
         "skew": f"{candidate['skew'] * 100:.1f}" if candidate.get("skew") is not None else "",
         "credit": f"{credit:.1f}",
-        "buying_power": f"{marginal_bp:.1f}" if marginal_bp is not None else "",
-        "credit to bpr": f"{credit / marginal_bp * 100:.1f}" if ranked else "",
-        "bpr to notional": f"{marginal_bp / notional * 100:.1f}" if ranked else "",
-        "credit to notional": f"{credit / notional * 100:.1f}",
+        "bpr": f"{marginal_bp:.1f}" if marginal_bp is not None else "",
+        "cr/bpr": f"{credit / marginal_bp * 100:.1f}" if ranked else "",
+        "bpr/ntl": f"{marginal_bp / notional * 100:.1f}" if ranked else "",
+        "cr/ntl": f"{credit / notional * 100:.1f}",
     }
     return row, msgs
 
@@ -813,13 +813,13 @@ FIELDNAMES = [
     "expiration",
     "dte",
     "strike",
-    "strike 52wk pct",
+    "52wk%",
     "chg%",
     "credit",
-    "buying_power",
-    "credit to bpr",
-    "bpr to notional",
-    "credit to notional",
+    "bpr",
+    "cr/bpr",
+    "bpr/ntl",
+    "cr/ntl",
     "ivr",
     "ivx",
     "skew",
@@ -830,13 +830,13 @@ SIGNED_COLUMNS = frozenset({"chg%", "skew"})
 
 # Columns rendered red below a threshold and green above it; the threshold itself
 # stays neutral.
-THRESHOLD_COLUMNS = {"strike 52wk pct": 50.0}
+THRESHOLD_COLUMNS = {"52wk%": 50.0}
 
 # Columns rendered green above a threshold; everything else stays neutral.
 HIGHLIGHT_ABOVE_COLUMNS = {"ivr": 50.0}
 
 # Columns rendered red at or below zero; everything else stays neutral.
-NONPOSITIVE_RED_COLUMNS = frozenset({"buying_power"})
+NONPOSITIVE_RED_COLUMNS = frozenset({"bpr"})
 
 
 def write_csv(rows, out=sys.stdout):
@@ -1046,10 +1046,10 @@ if __name__ == "__main__":
                 print(msg, file=sys.stderr)
             rows.append(row)
 
-    # Rows with a blank credit to bpr sort after every ranked row. The sort is stable,
+    # Rows with a blank cr/bpr sort after every ranked row. The sort is stable,
     # so they keep ticker order among themselves.
     rows.sort(
-        key=lambda r: (r["credit to bpr"] != "", float(r["credit to bpr"] or 0)),
+        key=lambda r: (r["cr/bpr"] != "", float(r["cr/bpr"] or 0)),
         reverse=True,
     )
 

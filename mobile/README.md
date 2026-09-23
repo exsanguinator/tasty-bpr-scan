@@ -88,7 +88,7 @@ but that needs this Mac serving the bundle.
 - Rows hold raw numbers and are formatted at render time, so table columns sort
   numerically rather than lexically.
 - Cells are colored as in `scan-put-bp.py`'s HTML output (the CSV is plain text):
-  `chg%` and `skew` green when positive and red when negative; `52wk %` red below 50
+  `chg%` and `skew` green when positive and red when negative; `52wk%` red below 50
   and green above; `ivr` green above 50; `bpr` red at or below zero. Ties and blanks keep
   the default text color, and the comparison uses the displayed value (so `50.0` or
   `-0.0` stays uncolored), as the HTML does.

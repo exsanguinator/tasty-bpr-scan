@@ -11,7 +11,7 @@ source .venv/bin/activate
 TASTY_ENV=prod python scan-put-bp.py [config-path] [--csv|--html] [--bpr-isolated|--bpr-impact] [--debug]
 ```
 
-Reads `account_number` and `watchlists` from `margin-scan-config.json` (or the config path given as the first argument). Output is CSV to stdout by default; `--html` writes a standalone sortable HTML table instead. `--bpr-isolated` (default) takes the `buying_power` column from the dry-run's `isolated-order-margin-requirement`; `--bpr-impact` takes it from `change-in-buying-power` instead, which already nets out the credit received. See README.md for full column definitions.
+Reads `account_number` and `watchlists` from `margin-scan-config.json` (or the config path given as the first argument). Output is CSV to stdout by default; `--html` writes a standalone sortable HTML table instead. `--bpr-isolated` (default) takes the `bpr` column from the dry-run's `isolated-order-margin-requirement`; `--bpr-impact` takes it from `change-in-buying-power` instead, which already nets out the credit received. See README.md for full column definitions.
 
 ## Running the Android app (mobile/)
 
@@ -41,7 +41,7 @@ See `mobile/README.md`.
 
 ### scan-put-bp.py
 
-Resolves equity tickers from configured watchlists, filters out `.IVR` symbols, symbols with `liquidity-rating < 2` (via `/market-metrics`, which also supplies the `ivr`/`ivx` columns), and symbols without weekly options. For each remaining ticker, picks the nearest-to-45-DTE monthly expiration's nearest OTM put strike, dry-runs a 1-lot sell-to-open order via `POST /accounts/{account_number}/orders/dry-run` to get the marginal buying-power impact, and ranks results by `credit to bpr` (see README.md for column definitions). `strike 52wk pct`, `credit`, `buying_power`, `credit to bpr`, `bpr to notional`, `credit to notional`, `ivr`, `ivx`, and `skew` are all output as zero-padded numbers with 1 decimal place (e.g. `"1.0"`), with the percentage-scale columns already multiplied by 100 (not raw fractions). `chg%` — the underlying mid's percentage move from `prev-close` — uses 2 decimal places instead.
+Resolves equity tickers from configured watchlists, filters out `.IVR` symbols, symbols with `liquidity-rating < 2` (via `/market-metrics`, which also supplies the `ivr`/`ivx` columns), and symbols without weekly options. For each remaining ticker, picks the nearest-to-45-DTE monthly expiration's nearest OTM put strike, dry-runs a 1-lot sell-to-open order via `POST /accounts/{account_number}/orders/dry-run` to get the marginal buying-power impact, and ranks results by `cr/bpr` (see README.md for column definitions). `52wk%`, `credit`, `bpr`, `cr/bpr`, `bpr/ntl`, `cr/ntl`, `ivr`, `ivx`, and `skew` are all output as zero-padded numbers with 1 decimal place (e.g. `"1.0"`), with the percentage-scale columns already multiplied by 100 (not raw fractions). `chg%` — the underlying mid's percentage move from `prev-close` — uses 2 decimal places instead.
 
 `skew` is 25-delta volatility skew, computed locally with scipy (`brentq` plus `scipy.stats.norm`) because no REST endpoint returns per-strike implied volatility or delta. It ignores dividends and approximates the forward with spot; see README.md for why, and do not "fix" that without measuring the effect on real quotes first. The mobile app computes the same column in `mobile/lib/skew.ts`, on top of the scipy replacements in `mobile/lib/blackscholes.ts`.
 

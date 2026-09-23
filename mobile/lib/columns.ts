@@ -60,7 +60,7 @@ export const COLUMNS: Column[] = [
   { key: "strike", label: "strike", width: 66, numeric: true, format: (r) => String(r.strike) },
   {
     key: "strike52wkPct",
-    label: "52wk %",
+    label: "52wk%",
     width: 74,
     numeric: true,
     threshold: 50,
