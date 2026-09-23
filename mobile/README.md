@@ -89,7 +89,7 @@ but that needs this Mac serving the bundle.
   numerically rather than lexically.
 - Cells are colored as in `scan-put-bp.py`'s HTML output (the CSV is plain text):
   `chg%` and `skew` green when positive and red when negative; `52wk%` red below 50
-  and green above; `ivr` green above 50; `bpr` red at or below zero. Ties and blanks keep
+  and green above; `ivr` green at or above 30; `bpr` red at or below zero. Ties and blanks keep
   the default text color, and the comparison uses the displayed value (so `50.0` or
   `-0.0` stays uncolored), as the HTML does.
 - The **BPR** setting picks which dry-run field becomes `bpr`, like the Python script's

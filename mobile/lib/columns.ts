@@ -38,8 +38,8 @@ export type Column = {
   nonpositiveRed?: boolean;
   /** Render the value red below this cutoff, green above it, plain at it. */
   threshold?: number;
-  /** Render the value green above this cutoff, plain otherwise. */
-  highlightAbove?: number;
+  /** Render the value green at or above this cutoff, plain otherwise. */
+  highlightAtLeast?: number;
   format: (row: ScanRow) => string;
 };
 
@@ -91,7 +91,7 @@ export const COLUMNS: Column[] = [
     label: "ivr",
     width: 58,
     numeric: true,
-    highlightAbove: 50,
+    highlightAtLeast: 30,
     format: (r) => oneDecimal(r.ivr),
   },
   { key: "ivx", label: "ivx", width: 58, numeric: true, format: (r) => oneDecimal(r.ivx) },

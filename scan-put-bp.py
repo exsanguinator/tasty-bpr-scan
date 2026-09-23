@@ -832,8 +832,8 @@ SIGNED_COLUMNS = frozenset({"chg%", "skew"})
 # stays neutral.
 THRESHOLD_COLUMNS = {"52wk%": 50.0}
 
-# Columns rendered green above a threshold; everything else stays neutral.
-HIGHLIGHT_ABOVE_COLUMNS = {"ivr": 50.0}
+# Columns rendered green at or above a threshold; everything else stays neutral.
+HIGHLIGHT_AT_LEAST_COLUMNS = {"ivr": 30.0}
 
 # Columns rendered red at or below zero; everything else stays neutral.
 NONPOSITIVE_RED_COLUMNS = frozenset({"bpr"})
@@ -872,8 +872,8 @@ def write_html(rows, out=sys.stdout, generated_at=None):
                 return ' class="neg"'
             if float(value) > threshold:
                 return ' class="pos"'
-        elif name in HIGHLIGHT_ABOVE_COLUMNS:
-            if float(value) > HIGHLIGHT_ABOVE_COLUMNS[name]:
+        elif name in HIGHLIGHT_AT_LEAST_COLUMNS:
+            if float(value) >= HIGHLIGHT_AT_LEAST_COLUMNS[name]:
                 return ' class="pos"'
         elif name in NONPOSITIVE_RED_COLUMNS:
             if float(value) <= 0:

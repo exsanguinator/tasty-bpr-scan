@@ -173,7 +173,7 @@ function signStyle(column: Column, row: ScanRow, theme: Theme) {
   if (column.threshold !== undefined) {
     return value > column.threshold ? positive : value < column.threshold ? negative : null;
   }
-  if (column.highlightAbove !== undefined) return value > column.highlightAbove ? positive : null;
+  if (column.highlightAtLeast !== undefined) return value >= column.highlightAtLeast ? positive : null;
   if (column.nonpositiveRed) return value <= 0 ? negative : null;
   return null;
 }
