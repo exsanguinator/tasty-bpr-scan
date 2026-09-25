@@ -225,12 +225,39 @@ Netlify deploys are full snapshots, so the script starts from the site's current
 list and pages published earlier stay up unless `--replace` is given. It prints each
 published URL once the deploy is live.
 
+## Publishing to Cloudflare
+
+`publish-cloudflare.py` takes the same arguments as `publish-netlify.py`, but deploys
+to a Cloudflare Pages project through the Pages direct-upload API:
+
+```bash
+python publish-cloudflare.py scan.html                  # → https://<project>.pages.dev/scan.html
+python publish-cloudflare.py scan.html --as index.html  # publish as the site's home page
+python publish-cloudflare.py scan.html --replace        # drop everything else on the site
+python publish-cloudflare.py --remove scan.html         # take a page off the site
+```
+
+It needs `CLOUDFLARE_API_TOKEN` (an API token with the *Cloudflare Pages: Edit*
+permission) and `CLOUDFLARE_ACCOUNT_ID` in `.env`. The project defaults to
+`tasty-bpr-scan` (https://tasty-bpr-scan.pages.dev); override it with `--project` or
+`CLOUDFLARE_PAGES_PROJECT`. Each run deploys to the project's production branch. Pages
+deployments are full snapshots, and Cloudflare has no API that lists a deployment's
+files, so each deploy also publishes `/publish-manifest.json`. The next run reads it
+back to keep earlier pages. Pages that were deployed some other way aren't in that
+manifest, so the first run drops them. Pages serves `/scan.html` as `/scan`, and the
+`.html` URLs the script prints redirect there.
+
 `sh-regt.sh` runs the whole pipeline: it scans the watchlists in
 `margin-scan-config-regt.json` (create it from `margin-scan-config.json.example`, like
 the default config) with `--html --bpr-isolated`, and publishes the result as the
 site's `index.html`. The scan is written to a temp file and moved into place only on
 success, so a failed scan stops the script without replacing the live page. It can be
 run from any directory, e.g. from cron.
+
+`sh-futures.sh` does the same for futures: it scans the watchlists in
+`margin-scan-config-futures.json` (create it the same way, listing watchlists of
+futures products such as `/ES`) with `--html --bpr-isolated`, and publishes the result
+as the site's `futures.html`.
 
 ## Notes
 
