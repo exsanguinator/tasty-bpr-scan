@@ -2,6 +2,7 @@ import type { ScanRow } from "./columns";
 import {
   DEFAULT_RISK_FREE_RATE,
   DIVIDEND_YIELD,
+  EQUITY_MULTIPLIER,
   computeSkew,
   selectSkewStrikes,
   type SkewInputs,
@@ -10,6 +11,19 @@ import { get, postDryRun } from "./tastyClient";
 
 const TARGET_DTE = 45;
 const MIN_LIQUIDITY_RATING = 2;
+// Futures ratings run lower than equities for products with perfectly tradeable
+// options (/NQ rates 1). A null rating means the product has no options at all
+// (/YM), so it still excludes.
+const MIN_FUTURES_LIQUIDITY_RATING = 1;
+// Futures products list their monthlies either as Regular (LO on /CL, OZN on /ZN)
+// or as End-Of-Month (EW on /ES, whose Regular expirations are the quarterlies).
+const EQUITY_MONTHLY_TYPES = new Set(["Regular"]);
+const FUTURES_MONTHLY_TYPES = new Set(["Regular", "End-Of-Month"]);
+// Micro futures (/MES, /MNQ) list a single near End-Of-Month and a quarterly, so
+// their nearest monthly can be days from expiry while weeklies sit near 45 DTE.
+// Past this many days from TARGET_DTE, futures take the nearest expiration of any
+// type instead.
+const MAX_FUTURES_MONTHLY_DISTANCE = 15;
 /** Chunk size for the batched market-data / market-metrics endpoints. */
 const CHUNK_SIZE = 100;
 /** Parallel in-flight requests for the per-ticker chain fetch and dry-run phases. */
@@ -49,6 +63,28 @@ export const BPR_MODES = {
 } as const;
 export type BprMode = keyof typeof BPR_MODES;
 export const DEFAULT_BPR_MODE: BprMode = "isolated";
+/**
+ * Futures options always come back with isolated-order-margin-requirement 0.0 and
+ * effect None, so isolated mode reads the order's change in margin requirement
+ * instead: still margin only, gross of the credit, but measured against the
+ * account's existing positions rather than on its own.
+ */
+export const FUTURES_BPR_MODES: Record<BprMode, string> = {
+  isolated: "change-in-margin-requirement",
+  impact: "change-in-buying-power",
+};
+
+function bprKey(bprMode: BprMode, future: boolean): string {
+  return (future ? FUTURES_BPR_MODES : BPR_MODES)[bprMode];
+}
+
+/**
+ * Futures products and contracts are the only watchlist symbols with a leading
+ * slash (/ES, /ESZ6).
+ */
+function isFuture(symbol: string): boolean {
+  return symbol.startsWith("/");
+}
 
 export type ScanResult = {
   rows: ScanRow[];
@@ -138,6 +174,104 @@ function roundToNickel(price: number): number {
   return Math.round(price / 0.05) * 0.05;
 }
 
+type TickSize = { threshold?: string; value: string };
+
+/**
+ * Rounds to the nearest valid tick. tickSizes is a futures chain expiration's
+ * tick-sizes list: each entry applies below its threshold, and the last one, with
+ * no threshold, applies above them all. null means an equity option.
+ */
+function formatLimitPrice(price: number, tickSizes: TickSize[] | null): string {
+  if (!tickSizes?.length) return roundToNickel(price).toFixed(2);
+  const tick = (
+    tickSizes.find((t) => t.threshold == null || price < parseFloat(t.threshold)) ??
+    tickSizes[tickSizes.length - 1]
+  ).value;
+  const decimals = tick.includes(".") ? tick.split(".")[1].replace(/0+$/, "").length : 0;
+  const size = parseFloat(tick);
+  return (Math.round(price / size) * size).toFixed(Math.max(decimals, 2));
+}
+
+/**
+ * Nearest-to-TARGET_DTE monthly, or the nearest of any type when there is no
+ * monthly or, with maxMonthlyDistance set, none that close to the target.
+ */
+function pickExpiration(
+  expirations: any[],
+  monthlyTypes: Set<string>,
+  maxMonthlyDistance: number | null = null,
+): any {
+  const distance = (e: any) => Math.abs(e["days-to-expiration"] - TARGET_DTE);
+  const nearest = (list: any[]) => list.reduce((best, e) => (distance(e) < distance(best) ? e : best));
+  const monthly = expirations.filter((e) => monthlyTypes.has(e["expiration-type"]));
+  if (monthly.length > 0) {
+    const best = nearest(monthly);
+    if (maxMonthlyDistance === null || distance(best) <= maxMonthlyDistance) return best;
+  }
+  return nearest(expirations);
+}
+
+/**
+ * Dollars per point of option price. The futures chain gives no multiplier
+ * directly, but notional-value is quoted per display-factor price unit: /ES
+ * 0.5 / 0.01 = 50, /CL 10 / 0.01 = 1000, /ZN 1000 / 1 = 1000.
+ */
+function contractMultiplier(expiration: any, future: boolean): number {
+  if (!future) return EQUITY_MULTIPLIER;
+  return parseFloat(expiration["notional-value"]) / parseFloat(expiration["display-factor"]);
+}
+
+type UnderlyingQuotes = {
+  mids: Map<string, number | null>;
+  ranges: Map<string, [number, number]>;
+  prevCloses: Map<string, number>;
+};
+
+/**
+ * Quotes for equities and futures contracts (/ESZ6, not the /ES product), one
+ * request per chunk. Futures quotes carry no 52-week range.
+ */
+async function fetchUnderlyingQuotes(
+  symbols: string[],
+  signal?: AbortSignal,
+  onChunk?: (done: number, total: number) => void,
+): Promise<UnderlyingQuotes> {
+  const jobs = [
+    ...chunked(symbols.filter((s) => !isFuture(s)).sort(), CHUNK_SIZE).map((chunk) => ({ param: "equity", chunk })),
+    ...chunked(symbols.filter(isFuture).sort(), CHUNK_SIZE).map((chunk) => ({ param: "future", chunk })),
+  ];
+  const out: UnderlyingQuotes = { mids: new Map(), ranges: new Map(), prevCloses: new Map() };
+  for (const [i, { param, chunk }] of jobs.entries()) {
+    onChunk?.(i, jobs.length);
+    const resp = await get("/market-data/by-type", { [param]: chunk.join(",") }, signal);
+    for (const item of resp.data.items as Quote[]) {
+      out.mids.set(item.symbol, mid(item));
+      const low = item["year-low-price"];
+      const high = item["year-high-price"];
+      if (low != null && high != null) {
+        out.ranges.set(item.symbol, [parseFloat(low), parseFloat(high)]);
+      }
+      const prevClose = item["prev-close"];
+      if (prevClose != null) out.prevCloses.set(item.symbol, parseFloat(prevClose));
+    }
+  }
+  onChunk?.(jobs.length, jobs.length);
+  return out;
+}
+
+/**
+ * The chain's expirations. A futures chain spans every contract month, so each of
+ * its expirations names its own underlying contract (/ESZ6).
+ */
+async function fetchExpirations(ticker: string, signal?: AbortSignal): Promise<any[]> {
+  if (isFuture(ticker)) {
+    const resp = await get(`/futures-option-chains/${ticker.slice(1)}/nested`, undefined, signal);
+    return (resp.data["option-chains"] ?? []).flatMap((chain: any) => chain.expirations ?? []);
+  }
+  const resp = await get(`/option-chains/${ticker}/nested`, undefined, signal);
+  return resp.data.items?.[0]?.expirations ?? [];
+}
+
 /**
  * /margin-requirements-public-configuration needs no auth and the API docs endorse
  * its rate as a Black-Scholes input. Falls back to a constant rather than failing
@@ -183,7 +317,10 @@ async function resolveTickers(watchlistNames: string[], signal?: AbortSignal): P
   for (const item of resp.data.items) {
     if (!wanted.has(item.name)) continue;
     for (const entry of item["watchlist-entries"] ?? []) {
-      if (entry["instrument-type"] === "Equity" && !entry.symbol.endsWith(".IVR")) {
+      const kind = entry["instrument-type"];
+      if (kind === "Equity" && !entry.symbol.endsWith(".IVR")) {
+        tickers.add(entry.symbol);
+      } else if (kind === "Future" && isFuture(entry.symbol)) {
         tickers.add(entry.symbol);
       }
     }
@@ -223,15 +360,18 @@ export async function runScan({
       if (ivx != null) ivxByTicker.set(item.symbol, parseFloat(ivx));
       expIvsByTicker.set(item.symbol, expirationIvs(item));
       const rating = item["liquidity-rating"];
-      if (rating != null && rating >= MIN_LIQUIDITY_RATING) {
+      const minimum = isFuture(item.symbol) ? MIN_FUTURES_LIQUIDITY_RATING : MIN_LIQUIDITY_RATING;
+      if (rating != null && rating >= minimum) {
         kept.push(item.symbol);
+      } else if (rating == null) {
+        skipped.push({ ticker: item.symbol, reason: "no liquidity-rating" });
       } else {
-        skipped.push({
-          ticker: item.symbol,
-          reason: `liquidity-rating ${rating} < ${MIN_LIQUIDITY_RATING}`,
-        });
+        skipped.push({ ticker: item.symbol, reason: `liquidity-rating ${rating} < ${minimum}` });
       }
     }
+  }
+  for (const ticker of tickers) {
+    if (!expIvsByTicker.has(ticker)) skipped.push({ ticker, reason: "no market metrics" });
   }
   report("metrics", metricChunks.length, metricChunks.length);
   tickers = kept.sort();
@@ -240,32 +380,24 @@ export async function runScan({
   throwIfAborted(signal);
   const riskFreeRate = await fetchRiskFreeRate(signal);
 
-  // Underlying quotes, 52-week ranges and previous closes.
-  const quoteChunks = chunked(tickers, CHUNK_SIZE);
-  const underlyingMids = new Map<string, number | null>();
-  const underlyingRanges = new Map<string, [number, number]>();
-  const prevCloses = new Map<string, number>();
-  for (const [i, chunk] of quoteChunks.entries()) {
-    report("quotes", i, quoteChunks.length);
-    const resp = await get("/market-data/by-type", { equity: chunk.join(",") }, signal);
-    for (const item of resp.data.items as Quote[]) {
-      underlyingMids.set(item.symbol, mid(item));
-      const low = item["year-low-price"];
-      const high = item["year-high-price"];
-      if (low != null && high != null) {
-        underlyingRanges.set(item.symbol, [parseFloat(low), parseFloat(high)]);
-      }
-      const prevClose = item["prev-close"];
-      if (prevClose != null) prevCloses.set(item.symbol, parseFloat(prevClose));
-    }
-  }
-  report("quotes", quoteChunks.length, quoteChunks.length);
+  // Underlying quotes, 52-week ranges and previous closes. Equities only: futures
+  // fetch their own contract's quote once the expiration is picked.
+  const equityQuotes = await fetchUnderlyingQuotes(
+    tickers.filter((t) => !isFuture(t)),
+    signal,
+    (done, total) => report("quotes", done, total),
+  );
 
   /**
    * Chooses which strikes the skew will need quotes for. Runs while the chain is
    * already in hand, so strike selection costs no request; only the quotes do.
    */
-  const pickSkewStrikes = (ticker: string, expiration: any, spot: number): SkewInputs | null => {
+  const pickSkewStrikes = (
+    ticker: string,
+    expiration: any,
+    spot: number,
+    multiplier: number,
+  ): SkewInputs | null => {
     const date = String(expiration["expiration-date"]).slice(0, 10);
     const seed = expIvsByTicker.get(ticker)?.get(date) || ivxByTicker.get(ticker);
     if (!seed) {
@@ -274,25 +406,28 @@ export async function runScan({
     }
     // Calendar time, matching the ACT/365 convention behind the ivx column.
     const t = Math.max(expiration["days-to-expiration"], 1) / 365;
-    const { calls, puts } = selectSkewStrikes(
-      expiration.strikes,
-      spot,
-      t,
-      riskFreeRate,
-      DIVIDEND_YIELD,
-      seed,
-    );
+    // q = r makes the forward the futures price itself (Black-76).
+    const q = isFuture(ticker) ? riskFreeRate : DIVIDEND_YIELD;
+    const { calls, puts } = selectSkewStrikes(expiration.strikes, spot, t, riskFreeRate, q, seed);
     if (!calls.length || !puts.length) {
       skipped.push({ ticker, reason: "skew: too few strikes near 25 delta" });
       return null;
     }
-    return { ticker, calls, puts, t, riskFreeRate, seed };
+    return { ticker, calls, puts, t, riskFreeRate, q, multiplier, seed };
   };
 
   // Per ticker: nearest-to-45-DTE expiration, nearest OTM put strike.
   throwIfAborted(signal);
   type Candidate = {
     ticker: string;
+    /** The ticker for equities; the picked expiration's contract (/ESZ6) for futures. */
+    underlyingSymbol: string;
+    underlyingMid: number;
+    /** Dollars per point of option price. */
+    multiplier: number;
+    optionInstrumentType: "Equity Option" | "Future Option";
+    /** Futures tick sizes vary by product; null keeps equities on a nickel. */
+    tickSizes: TickSize[] | null;
     expiration: string;
     dte: number;
     strike: number;
@@ -310,37 +445,40 @@ export async function runScan({
     CONCURRENCY,
     async (ticker) => {
       throwIfAborted(signal);
-      const underlyingMid = underlyingMids.get(ticker);
-      if (underlyingMid == null) {
+      const future = isFuture(ticker);
+      if (!future && equityQuotes.mids.get(ticker) == null) {
         skipped.push({ ticker, reason: "no underlying quote" });
         return null;
       }
-      let resp;
+      let expirations: any[];
       try {
-        resp = await get(`/option-chains/${ticker}/nested`, undefined, signal);
+        expirations = await fetchExpirations(ticker, signal);
       } catch (error) {
         if (isAbortError(error)) throw error;
         skipped.push({ ticker, reason: `option chain fetch failed: ${errorReason(error)}` });
         return null;
       }
-      const items = resp.data.items;
-      if (!items?.length || !items[0].expirations?.length) {
+      if (!expirations.length) {
         skipped.push({ ticker, reason: "no expirations found" });
         return null;
       }
-      const expirations = items[0].expirations as any[];
-      if (!expirations.some((e) => e["expiration-type"] === "Weekly")) {
+      // Weeklies are an equity liquidity screen. Plenty of liquid futures products
+      // (/ZS, /6E, /NG) list none, so futures rely on the liquidity rating alone.
+      if (!future && !expirations.some((e) => e["expiration-type"] === "Weekly")) {
         skipped.push({ ticker, reason: "no weekly options" });
         return null;
       }
-      const regular = expirations.filter((e) => e["expiration-type"] === "Regular");
-      const candidates = regular.length > 0 ? regular : expirations;
-      const expiration = candidates.reduce((best, e) =>
-        Math.abs(e["days-to-expiration"] - TARGET_DTE) <
-        Math.abs(best["days-to-expiration"] - TARGET_DTE)
-          ? e
-          : best,
-      );
+      const expiration = future
+        ? pickExpiration(expirations, FUTURES_MONTHLY_TYPES, MAX_FUTURES_MONTHLY_DISTANCE)
+        : pickExpiration(expirations, EQUITY_MONTHLY_TYPES);
+      const underlyingSymbol: string = future ? expiration["underlying-symbol"] : ticker;
+      const quotes = future ? await fetchUnderlyingQuotes([underlyingSymbol], signal) : equityQuotes;
+      const underlyingMid = quotes.mids.get(underlyingSymbol);
+      if (underlyingMid == null) {
+        skipped.push({ ticker, reason: `no underlying quote for ${underlyingSymbol}` });
+        return null;
+      }
+      const multiplier = contractMultiplier(expiration, future);
       const otm = (expiration.strikes as any[])
         .map((s) => ({ ...s, price: parseFloat(s["strike-price"]) }))
         .sort((a, b) => a.price - b.price)
@@ -350,16 +488,21 @@ export async function runScan({
         return null;
       }
       const strike = otm[otm.length - 1];
-      const range = underlyingRanges.get(ticker);
+      const range = quotes.ranges.get(underlyingSymbol);
       return {
         ticker,
+        underlyingSymbol,
+        underlyingMid,
+        multiplier,
+        optionInstrumentType: future ? "Future Option" : "Equity Option",
+        tickSizes: future ? (expiration["tick-sizes"] ?? null) : null,
         expiration: expiration["expiration-date"],
         dte: expiration["days-to-expiration"],
         strike: strike.price,
         putSymbol: strike.put,
         strike52wkPosition: range ? strikePositionIn52wkRange(strike.price, range) : null,
-        chg: changeFromPrevClose(underlyingMid, prevCloses.get(ticker)),
-        skewInputs: pickSkewStrikes(ticker, expiration, underlyingMid),
+        chg: changeFromPrevClose(underlyingMid, quotes.prevCloses.get(underlyingSymbol)),
+        skewInputs: pickSkewStrikes(ticker, expiration, underlyingMid, multiplier),
         skew: null,
       };
     },
@@ -375,14 +518,19 @@ export async function runScan({
     [...(c.skewInputs?.calls ?? []), ...(c.skewInputs?.puts ?? [])].map(([, symbol]) => symbol),
   );
   const optionSymbols = [...new Set([...candidates.map((c) => c.putSymbol), ...skewSymbols])].sort();
-  const optionChunks = chunked(optionSymbols, CHUNK_SIZE);
+  // Futures option symbols start with "./" (./ESZ6 EW1X6 261106P7625).
+  const isFutureOption = (symbol: string) => symbol.startsWith("./");
   // The underlying mids above are stale by a whole chain-fetch phase, and a wrong
   // spot moves call and put implied vol in opposite directions, landing straight on
   // the skew. These chunks buy a spot contemporaneous with the option quotes.
-  const spotChunks = chunked(candidates.map((c) => c.ticker).sort(), CHUNK_SIZE);
+  const spotSymbols = [...new Set(candidates.map((c) => c.underlyingSymbol))].sort();
+  const jobsFor = (param: string, symbols: string[]) =>
+    chunked(symbols, CHUNK_SIZE).map((chunk) => ({ param, chunk }));
   const quoteJobs = [
-    ...optionChunks.map((chunk) => ({ param: "equity-option", chunk }) as const),
-    ...spotChunks.map((chunk) => ({ param: "equity", chunk }) as const),
+    ...jobsFor("equity-option", optionSymbols.filter((s) => !isFutureOption(s))),
+    ...jobsFor("future-option", optionSymbols.filter(isFutureOption)),
+    ...jobsFor("equity", spotSymbols.filter((s) => !isFuture(s))),
+    ...jobsFor("future", spotSymbols.filter(isFuture)),
   ];
   const optionQuotes = new Map<string, Quote>();
   const skewSpots = new Map<string, number | null>();
@@ -395,7 +543,7 @@ export async function runScan({
       throwIfAborted(signal);
       const resp = await get("/market-data/by-type", { [param]: chunk.join(",") }, signal);
       for (const item of resp.data.items as Quote[]) {
-        if (param === "equity-option") optionQuotes.set(item.symbol, item);
+        if (param.endsWith("-option")) optionQuotes.set(item.symbol, item);
         else skewSpots.set(item.symbol, mid(item));
       }
     },
@@ -406,7 +554,7 @@ export async function runScan({
   // Skew, from the quotes just fetched. A skew that cannot be resolved blanks that
   // one cell and notes why; it never drops the row.
   for (const c of candidates) {
-    const spot = skewSpots.get(c.ticker) ?? underlyingMids.get(c.ticker) ?? null;
+    const spot = skewSpots.get(c.underlyingSymbol) ?? c.underlyingMid;
     try {
       const { skew, messages } = computeSkew(c.skewInputs, optionQuotes, spot);
       c.skew = skew;
@@ -437,19 +585,19 @@ export async function runScan({
       // buying power the buying-power columns are blank, and when it yields <= 0,
       // bpr is shown but the ratios built on it are blank. The `bpr:` entries in
       // skipped are notes on those cells, like the `skew:` ones, not skips.
-      const field = BPR_MODES[bprMode];
+      const field = bprKey(bprMode, isFuture(c.ticker));
       let marginalBp: number | null = null;
       try {
         const resp = await postDryRun(
           `/accounts/${accountNumber}/orders/dry-run`,
           {
             "order-type": "Limit",
-            price: roundToNickel(creditMid).toFixed(2),
+            price: formatLimitPrice(creditMid, c.tickSizes),
             "price-effect": "Credit",
             "time-in-force": "Day",
             legs: [
               {
-                "instrument-type": "Equity Option",
+                "instrument-type": c.optionInstrumentType,
                 symbol: c.putSymbol,
                 quantity: "1",
                 action: "Sell to Open",
@@ -458,7 +606,7 @@ export async function runScan({
           },
           signal,
         );
-        marginalBp = extractMarginalBuyingPower(resp, bprMode);
+        marginalBp = extractMarginalBuyingPower(resp, field);
         if (marginalBp === null) {
           const errors = resp?.error?.errors ?? [];
           const hard = errors.filter((e: any) => e.code !== "margin_check_failed");
@@ -477,8 +625,8 @@ export async function runScan({
       }
       // Only a positive buying power makes a meaningful denominator.
       const ranked = marginalBp !== null && marginalBp > 0;
-      const credit = creditMid * 100;
-      const notional = c.strike * 100;
+      const credit = creditMid * c.multiplier;
+      const notional = c.strike * c.multiplier;
       return {
         ticker: c.ticker,
         expiration: c.expiration,
@@ -532,16 +680,16 @@ function expirationIvs(item: any): Map<string, number> {
 }
 
 /**
- * The selected mode's field, signed. Amounts are unsigned with the direction in a
- * sibling -effect field; a Credit means the order frees buying power (e.g. a
- * credit larger than the margin it adds), so it comes back negative.
+ * The selected buying-power-effect field (see bprKey), signed. Amounts are
+ * unsigned with the direction in a sibling -effect field; a Credit means the order
+ * frees buying power (e.g. a credit larger than the margin it adds), so it comes
+ * back negative.
  */
-export function extractMarginalBuyingPower(resp: any, bprMode: BprMode): number | null {
+export function extractMarginalBuyingPower(resp: any, key: string): number | null {
   const bpe = resp?.data?.["buying-power-effect"] ?? {};
   const errors: any[] = resp?.error?.errors ?? [];
   const hard = errors.filter((e) => e.code !== "margin_check_failed");
   if (hard.length && Object.keys(bpe).length === 0) return null;
-  const key = BPR_MODES[bprMode];
   const amount = bpe[key] == null ? NaN : Math.abs(parseFloat(bpe[key]));
   if (!Number.isFinite(amount)) return null;
   // The `&& amount` keeps a zero Credit from becoming -0.

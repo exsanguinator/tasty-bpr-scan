@@ -34,7 +34,9 @@ collected rather than printed to stderr, and the BPR mode is a Settings radio
 (`isolated` default / `impact`) rather than a `--bpr-*` flag. `lib/skew.ts` ports the `skew` column and
 `lib/blackscholes.ts` replaces scipy (`scipy.stats.norm` and `brentq`) with local
 implementations; the two agree with the Python output to the printed decimal on a
-full production watchlist. Keep all of these in sync when changing the scan logic.
+full production watchlist, equities and futures alike, apart from values ending in an
+exact half (e.g. a `/ZB` credit of 1781.25), which Python's round-half-even prints as
+`1781.2` and JS `toFixed` as `1781.3`. Keep all of these in sync when changing the scan logic.
 See `mobile/README.md`.
 
 ## Architecture
@@ -47,7 +49,7 @@ Resolves equity tickers and futures products (`/ES`; `is_future()` keys off the 
 
 Both per-ticker loops — the `/option-chains/{ticker}/nested` fetches in `find_candidates()` and the dry-runs — run on a `ThreadPoolExecutor` with `CONCURRENCY = min(os.cpu_count() or 4, 16)` workers. These are network-bound, so the cap exists to stay under the API's rate limit rather than to match the CPU. Workers return their stderr messages instead of printing, and the main thread prints them in ticker order, so output stays identical to the serial version. Token refresh is guarded by `_token_lock` (with `_refresh_token_if_stale()` collapsing a simultaneous 401 storm into a single refresh).
 
-**Futures:** chains come from `/futures-option-chains/{product}/nested`, and each expiration names its own underlying contract (`/ESZ6`), whose quote is fetched inside the chain worker once the expiration is picked. Monthly means `Regular` or `End-Of-Month` (`/ES` monthlies are EOM; its Regular ones are quarterlies); if the nearest monthly is more than `MAX_FUTURES_MONTHLY_DISTANCE` (15) days from 45 DTE, the nearest expiration of any type is used, which is what gives the micros (`/MES`, `/MNQ`) a weekly. The weekly screen is skipped. The multiplier is `notional-value / display-factor`, the limit price is rounded to the chain's `tick-sizes`, and the dry-run leg is `Future Option`. Futures dry-runs always return `isolated-order-margin-requirement` as 0, so `--bpr-isolated` reads `change-in-margin-requirement` for them (`FUTURES_BPR_MODES`). Skew uses Black-76 (q = r), and the price-unit quote filters scale by `100 / multiplier`. Futures quotes have no 52-week range, so `52wk%` is blank. The mobile app does not handle futures yet.
+**Futures:** chains come from `/futures-option-chains/{product}/nested`, and each expiration names its own underlying contract (`/ESZ6`), whose quote is fetched inside the chain worker once the expiration is picked. Monthly means `Regular` or `End-Of-Month` (`/ES` monthlies are EOM; its Regular ones are quarterlies); if the nearest monthly is more than `MAX_FUTURES_MONTHLY_DISTANCE` (15) days from 45 DTE, the nearest expiration of any type is used, which is what gives the micros (`/MES`, `/MNQ`) a weekly. The weekly screen is skipped. The multiplier is `notional-value / display-factor`, the limit price is rounded to the chain's `tick-sizes`, and the dry-run leg is `Future Option`. Futures dry-runs always return `isolated-order-margin-requirement` as 0, so `--bpr-isolated` reads `change-in-margin-requirement` for them (`FUTURES_BPR_MODES`). Skew uses Black-76 (q = r), and the price-unit quote filters scale by `100 / multiplier`. Futures quotes have no 52-week range, so `52wk%` is blank. `mobile/lib/scan.ts` and `mobile/lib/skew.ts` port all of this.
 
 It hard-requires `TASTY_ENV=prod` and exits early otherwise, since it depends on `/market-data/by-type` for underlying/option prices.
 

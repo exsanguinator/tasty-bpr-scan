@@ -30,6 +30,18 @@ export const DIVIDEND_YIELD = 0;
 
 export const DEFAULT_RISK_FREE_RATE = 0.04;
 
+/** Shares per equity option contract. */
+export const EQUITY_MULTIPLIER = 100;
+
+// Futures options use the same formulas with q = r, which is Black-76 on the
+// futures price.
+//
+// MIN_VEGA, MIN_OPTION_MID, MAX_SPREAD_ABSOLUTE and the lower-bound margin in
+// solveSide are in equity option price units (per share of a 100-share
+// contract). Futures options scale them by 100 / multiplier so each holds the
+// same dollars per contract: 0.10 on an equity option is $10, and so is 0.20
+// points on /ES (x50) or 0.00008 on /6E (x125,000).
+
 const SIGMA_BRACKET: [number, number] = [0.01, 3.0];
 const MIN_SIGMA = 0.03;
 const MAX_SIGMA = 3.0;
@@ -95,17 +107,18 @@ function impliedVol(
   t: number,
   r: number,
   q: number,
+  multiplier = EQUITY_MULTIPLIER,
 ): number | null {
   const [lo, hi] = SIGMA_BRACKET;
   const sigma = brentq((sig) => bsPrice(isCall, s, k, t, r, q, sig) - price, lo, hi, 1e-6);
   if (sigma === null) return null;
   if (sigma <= lo + 1e-4 || sigma >= hi - 1e-4) return null;
   if (sigma < MIN_SIGMA || sigma > MAX_SIGMA) return null;
-  if (bsVega(s, k, t, r, q, sigma) < MIN_VEGA) return null;
+  if (bsVega(s, k, t, r, q, sigma, multiplier) < MIN_VEGA) return null;
   return sigma;
 }
 
-/** One strike entry from an `/option-chains/{ticker}/nested` expiration. */
+/** One strike entry from an `/option-chains/{ticker}/nested` (or futures) expiration. */
 type ChainStrike = { "strike-price"?: string | null; call?: string | null; put?: string | null };
 
 /**
@@ -161,7 +174,9 @@ function solveSide(
   t: number,
   r: number,
   q: number,
+  multiplier = EQUITY_MULTIPLIER,
 ): [number, number][] {
+  const scale = EQUITY_MULTIPLIER / multiplier;
   const points: [number, number][] = [];
   for (const [strike, symbol] of entries) {
     const item = quotes.get(symbol);
@@ -169,10 +184,10 @@ function solveSide(
     const twoSided = twoSidedMid(item);
     if (!twoSided) continue;
     const { mid, bid, ask } = twoSided;
-    if (mid < MIN_OPTION_MID) continue;
-    if (ask - bid > Math.max(MAX_SPREAD_ABSOLUTE, MAX_SPREAD_RELATIVE * mid)) continue;
-    if (mid <= europeanLowerBound(isCall, s, strike, t, r, q) + 0.01) continue;
-    const sigma = impliedVol(isCall, mid, s, strike, t, r, q);
+    if (mid < MIN_OPTION_MID * scale) continue;
+    if (ask - bid > Math.max(MAX_SPREAD_ABSOLUTE * scale, MAX_SPREAD_RELATIVE * mid)) continue;
+    if (mid <= europeanLowerBound(isCall, s, strike, t, r, q) + 0.01 * scale) continue;
+    const sigma = impliedVol(isCall, mid, s, strike, t, r, q, multiplier);
     if (sigma === null) continue;
     const d1 = bsD1(s, strike, t, r, q, sigma);
     points.push([isCall ? d1 : -d1, sigma]);
@@ -225,6 +240,10 @@ export type SkewInputs = {
   /** Time to expiration in years, ACT/365. */
   t: number;
   riskFreeRate: number;
+  /** Dividend yield: DIVIDEND_YIELD for equities, the risk-free rate for futures (Black-76). */
+  q: number;
+  /** Dollars per point of option price: 100 for equities, the contract's for futures. */
+  multiplier: number;
   /** The at-the-money vol the strike selection was seeded from. */
   seed: number;
 };
@@ -242,15 +261,14 @@ export function computeSkew(
   if (!inputs || !inputs.calls.length || !inputs.puts.length || !spot) {
     return { skew: null, messages };
   }
-  const { t, riskFreeRate: r } = inputs;
-  const q = DIVIDEND_YIELD;
+  const { t, riskFreeRate: r, q, multiplier } = inputs;
 
   const ivs: Record<"call" | "put", number | null> = { call: null, put: null };
   for (const [side, isCall, entries] of [
     ["call", true, inputs.calls],
     ["put", false, inputs.puts],
   ] as const) {
-    const points = solveSide(isCall, entries, quotes, spot, t, r, q);
+    const points = solveSide(isCall, entries, quotes, spot, t, r, q, multiplier);
     const iv = interpolateIvAtDelta(points, q, t);
     if (iv === null) {
       // |delta| = exp(-qt) * N(x) on both sides, by construction of x.

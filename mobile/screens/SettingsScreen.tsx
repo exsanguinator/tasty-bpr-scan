@@ -11,6 +11,7 @@ import {
 
 import {
   BPR_MODES,
+  FUTURES_BPR_MODES,
   fetchAccounts,
   fetchWatchlists,
   type Account,
@@ -123,6 +124,9 @@ export function SettingsScreen({ settings, onChange }: Props) {
               <Text style={styles.rowLabel}>{mode}</Text>
               <Text style={styles.rowSub}>{BPR_MODE_DESCRIPTIONS[mode]}</Text>
               <Text style={styles.rowSub}>{BPR_MODES[mode]}</Text>
+              {FUTURES_BPR_MODES[mode] !== BPR_MODES[mode] ? (
+                <Text style={styles.rowSub}>futures: {FUTURES_BPR_MODES[mode]}</Text>
+              ) : null}
             </View>
           </Pressable>
         );

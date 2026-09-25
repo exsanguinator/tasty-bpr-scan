@@ -226,7 +226,7 @@ export function bsDelta(
 }
 
 /**
- * Per 1.00 of vol, and per contract: 100 shares, so a vega of 1.0 is a cent of
+ * Per 1.00 of vol, and per contract: for 100 shares, a vega of 1.0 is a cent of
  * option price per vol point.
  */
 export function bsVega(
@@ -236,9 +236,10 @@ export function bsVega(
   r: number,
   q: number,
   sigma: number,
+  multiplier = 100,
 ): number {
   const d1 = bsD1(s, k, t, r, q, sigma);
-  return s * Math.exp(-q * t) * normPdf(d1) * Math.sqrt(t) * 100;
+  return s * Math.exp(-q * t) * normPdf(d1) * Math.sqrt(t) * multiplier;
 }
 
 export function europeanLowerBound(

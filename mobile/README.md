@@ -1,7 +1,8 @@
 # Put BP Scan (Android)
 
 A standalone Expo / React Native port of the repo's `scan-put-bp.py`. Ranks short-put
-candidates from your Tastytrade watchlists by credit-to-buying-power efficiency and
+candidates (equities and futures products such as `/ES`) from your Tastytrade
+watchlists by credit-to-buying-power efficiency and
 renders them in a sortable on-screen table. No backend — the phone talks to the
 Tastytrade API directly.
 
@@ -32,6 +33,23 @@ flag (both default to `--bpr-isolated`).
 ```bash
 npm run typecheck
 ```
+
+## Futures
+
+Futures watchlist entries (`/ES`, `/CL`, micros like `/MES`) are scanned the same way
+as in `scan-put-bp.py`; see the repo README for the reasoning behind each rule:
+
+- Chains come from `/futures-option-chains/{product}/nested`, and the underlying is
+  the contract the picked expiration settles into (`/ESZ6`), quoted inside the chain
+  phase once the expiration is known.
+- Monthly means `Regular` or `End-Of-Month`. If the nearest monthly is more than 15
+  days from 45 DTE, the nearest expiration of any type is used.
+- No weekly-options screen, and the liquidity bar is a rating of 1 rather than 2 (a
+  missing rating still skips).
+- `credit` and notional use `notional-value / display-factor` as the multiplier, the
+  dry-run price is rounded to the chain's `tick-sizes`, and the leg is `Future Option`.
+- `skew` uses Black-76 (q = r), with the quote filters scaled by the multiplier.
+- `52wk%` is blank: futures quotes carry no 52-week range.
 
 ## Building an APK
 
@@ -94,7 +112,9 @@ but that needs this Mac serving the bundle.
   `-0.0` stays uncolored), as the HTML does.
 - The **BPR** setting picks which dry-run field becomes `bpr`, like the Python script's
   `--bpr-isolated` (default, `isolated-order-margin-requirement`) and `--bpr-impact`
-  (`change-in-buying-power`, which already nets out the credit received). The status line
+  (`change-in-buying-power`, which already nets out the credit received). Futures
+  options always report the isolated field as 0, so for them `isolated` reads
+  `change-in-margin-requirement`; the setting lists that field under the mode. The status line
   shows the mode the displayed result was scanned with, since changing the setting only
   takes effect on the next Refresh. As in the Python script, a ticker whose dry-run fails
   or lacks that field keeps its row with `bpr`, `cr/bpr` and `bpr/ntl` blank, and one
