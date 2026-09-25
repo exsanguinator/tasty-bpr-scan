@@ -25,6 +25,18 @@ BPR_MODES = {
     "impact": "change-in-buying-power",
 }
 DEFAULT_BPR_MODE = "isolated"
+# Futures options always come back with isolated-order-margin-requirement 0.0 and
+# effect None, so isolated mode reads the order's change in margin requirement
+# instead: still margin only, gross of the credit, but measured against the
+# account's existing positions rather than on its own.
+FUTURES_BPR_MODES = {
+    "isolated": "change-in-margin-requirement",
+    "impact": "change-in-buying-power",
+}
+
+
+def bpr_key(bpr_mode, is_future_ticker):
+    return (FUTURES_BPR_MODES if is_future_ticker else BPR_MODES)[bpr_mode]
 
 
 def parse_args(argv):
@@ -35,9 +47,10 @@ def parse_args(argv):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Rank short-put candidates from your tastytrade watchlists by credit to\n"
-            "buying-power efficiency. For each liquid ticker with weekly options, picks\n"
-            "the nearest OTM put in the monthly expiration closest to 45 DTE, dry-runs\n"
-            "a 1-lot sell-to-open order, and ranks the results by `cr/bpr`."
+            "buying-power efficiency. For each liquid equity with weekly options, and\n"
+            "each liquid futures product (e.g. /ES), picks the nearest OTM put in the\n"
+            "monthly expiration closest to 45 DTE, dry-runs a 1-lot sell-to-open\n"
+            "order, and ranks the results by `cr/bpr`."
         ),
         epilog=(
             "environment:\n"
@@ -210,6 +223,14 @@ def post_dry_run(path, body):
 
 TARGET_DTE = 45
 
+EQUITY_MULTIPLIER = 100
+
+
+def is_future(symbol):
+    """Futures products and contracts are the only watchlist symbols with a
+    leading slash (/ES, /ESZ6)."""
+    return symbol.startswith("/")
+
 # Both per-ticker loops below are network-bound (one HTTP request per ticker), so
 # workers spend their time blocked on the API rather than on the CPU. Capped so a
 # many-core machine doesn't run into the API's rate limit.
@@ -255,19 +276,29 @@ def resolve_tickers(watchlist_names):
         if item["name"] not in wanted:
             continue
         for entry in item["watchlist-entries"]:
-            if entry["instrument-type"] == "Equity" and not entry["symbol"].endswith(".IVR"):
-                tickers.add(entry["symbol"])
+            kind = entry["instrument-type"]
+            symbol = entry["symbol"]
+            if kind == "Equity" and not symbol.endswith(".IVR"):
+                tickers.add(symbol)
+            elif kind == "Future" and is_future(symbol):
+                tickers.add(symbol)
     return tickers
 
 
-def fetch_equity_mids(tickers):
-    """Returns (mids, underlying_by_ticker). The per-ticker dict carries everything
+def fetch_underlying_mids(symbols):
+    """Returns (mids, underlying_by_symbol) for equities and futures contracts
+    (/ESZ6, not the /ES product). The per-symbol dict carries everything
     downstream needs about the underlying, so adding a field here doesn't mean
-    adding another positional argument to every function in the call chain."""
+    adding another positional argument to every function in the call chain.
+    Futures quotes carry no 52-week range, so their year_range is None."""
     mids = {}
     underlying = {}
-    for chunk in chunked(sorted(tickers), 100):
-        resp = get("/market-data/by-type", equity=",".join(chunk))
+    futures = sorted(s for s in symbols if is_future(s))
+    equities = sorted(s for s in symbols if not is_future(s))
+    requests_ = [("equity", c) for c in chunked(equities, 100)]
+    requests_ += [("future", c) for c in chunked(futures, 100)]
+    for param, chunk in requests_:
+        resp = get("/market-data/by-type", **{param: ",".join(chunk)})
         for item in resp["data"]["items"]:
             symbol = item["symbol"]
             mids[symbol] = _mid(item)
@@ -326,12 +357,18 @@ def fetch_option_quotes(symbols):
     The chunk loop is parallel because skew multiplies the symbol count by an
     order of magnitude, and serially those chunks would be the only unparallelized
     phase left in the scan."""
-    chunks = list(chunked(sorted(set(symbols)), 100))
+    unique = sorted(set(symbols))
+    # Futures option symbols start with "./" (./ESZ6 EW1X6 261106P7625).
+    futures = [s for s in unique if s.startswith("./")]
+    equities = [s for s in unique if not s.startswith("./")]
+    chunks = [("equity-option", c) for c in chunked(equities, 100)]
+    chunks += [("future-option", c) for c in chunked(futures, 100)]
     if not chunks:
         return {}
 
-    def fetch(chunk):
-        resp = get("/market-data/by-type", **{"equity-option": ",".join(chunk)})
+    def fetch(param_chunk):
+        param, chunk = param_chunk
+        resp = get("/market-data/by-type", **{param: ",".join(chunk)})
         return resp["data"]["items"]
 
     quotes = {}
@@ -343,6 +380,10 @@ def fetch_option_quotes(symbols):
 
 
 MIN_LIQUIDITY_RATING = 2
+# Futures ratings run lower than equities for products with perfectly tradeable
+# options (/NQ rates 1). A None rating means the product has no options at all
+# (/YM), so it still excludes.
+MIN_FUTURES_LIQUIDITY_RATING = 1
 
 
 def filter_by_liquidity(tickers):
@@ -361,13 +402,18 @@ def filter_by_liquidity(tickers):
                 "exp_ivs": _expiration_ivs(item),
             }
             rating = item.get("liquidity-rating")
-            if rating is not None and rating >= MIN_LIQUIDITY_RATING:
+            minimum = MIN_FUTURES_LIQUIDITY_RATING if is_future(symbol) else MIN_LIQUIDITY_RATING
+            if rating is not None and rating >= minimum:
                 kept.add(symbol)
+            elif rating is None:
+                print(f"  {symbol}: no liquidity-rating, skipping", file=sys.stderr)
             else:
                 print(
-                    f"  {symbol}: liquidity-rating {rating} < {MIN_LIQUIDITY_RATING}, skipping",
+                    f"  {symbol}: liquidity-rating {rating} < {minimum}, skipping",
                     file=sys.stderr,
                 )
+    for symbol in sorted(tickers - metrics.keys()):
+        print(f"  {symbol}: no market metrics, skipping", file=sys.stderr)
     return kept, metrics
 
 
@@ -405,7 +451,14 @@ def _two_sided_mid(item):
 
 # Black-Scholes with a continuous dividend yield. European, while US equity
 # options are American - see the `skew` column notes in README.md for the size
-# and direction of the resulting bias.
+# and direction of the resulting bias. Futures options use the same formulas with
+# q = r, which is Black-76 on the futures price.
+#
+# MIN_VEGA, MIN_OPTION_MID, MAX_SPREAD_ABSOLUTE and the lower-bound margin in
+# _solve_side are in equity option price units (per share of a 100-share
+# contract). Futures options scale them by 100 / multiplier so each holds the
+# same dollars per contract: 0.10 on an equity option is $10, and so is 0.20
+# points on /ES (x50) or 0.00008 on /6E (x125,000).
 SIGMA_BRACKET = (0.01, 3.0)
 MIN_SIGMA = 0.03
 MAX_SIGMA = 3.0
@@ -439,11 +492,11 @@ def bs_delta(is_call, s, k, t, r, q, sigma):
     return math.exp(-q * t) * (norm.cdf(d1) if is_call else norm.cdf(d1) - 1)
 
 
-def bs_vega(s, k, t, r, q, sigma):
-    """Per 1.00 of vol, and per contract: 100 shares, so a vega of 1.0 is a cent
+def bs_vega(s, k, t, r, q, sigma, multiplier=EQUITY_MULTIPLIER):
+    """Per 1.00 of vol, and per contract: for 100 shares, a vega of 1.0 is a cent
     of option price per vol point."""
     d1 = bs_d1(s, k, t, r, q, sigma)
-    return s * math.exp(-q * t) * norm.pdf(d1) * math.sqrt(t) * 100
+    return s * math.exp(-q * t) * norm.pdf(d1) * math.sqrt(t) * multiplier
 
 
 def european_lower_bound(is_call, s, k, t, r, q):
@@ -452,7 +505,7 @@ def european_lower_bound(is_call, s, k, t, r, q):
     return max(0.0, forward - discounted_strike if is_call else discounted_strike - forward)
 
 
-def implied_vol(is_call, price, s, k, t, r, q):
+def implied_vol(is_call, price, s, k, t, r, q, multiplier=EQUITY_MULTIPLIER):
     """Returns None rather than clamping when the price falls outside the sigma
     bracket: a solution pinned to an endpoint is not a solution, and it would
     distort the interpolation far more than a missing point does."""
@@ -467,15 +520,36 @@ def implied_vol(is_call, price, s, k, t, r, q):
         return None
     if not MIN_SIGMA <= sigma <= MAX_SIGMA:
         return None
-    if bs_vega(s, k, t, r, q, sigma) < MIN_VEGA:
+    if bs_vega(s, k, t, r, q, sigma, multiplier) < MIN_VEGA:
         return None
     return sigma
 
 
-def pick_expiration(expirations):
-    regular = [e for e in expirations if e["expiration-type"] == "Regular"]
-    candidates = regular or expirations
-    return min(candidates, key=lambda e: abs(e["days-to-expiration"] - TARGET_DTE))
+# Futures products list their monthlies either as Regular (LO on /CL, OZN on /ZN)
+# or as End-Of-Month (EW on /ES, whose Regular expirations are the quarterlies).
+EQUITY_MONTHLY_TYPES = frozenset({"Regular"})
+FUTURES_MONTHLY_TYPES = frozenset({"Regular", "End-Of-Month"})
+
+
+# Micro futures (/MES, /MNQ) list a single near End-Of-Month and a quarterly, so
+# their nearest monthly can be days from expiry while weeklies sit near 45 DTE.
+# Past this many days from TARGET_DTE, futures take the nearest expiration of
+# any type instead.
+MAX_FUTURES_MONTHLY_DISTANCE = 15
+
+
+def pick_expiration(expirations, monthly_types=EQUITY_MONTHLY_TYPES, max_monthly_distance=None):
+    """Nearest-to-TARGET_DTE monthly, or the nearest of any type when there is no
+    monthly or, with max_monthly_distance set, none that close to the target."""
+    def distance(e):
+        return abs(e["days-to-expiration"] - TARGET_DTE)
+
+    regular = [e for e in expirations if e["expiration-type"] in monthly_types]
+    if regular:
+        best = min(regular, key=distance)
+        if max_monthly_distance is None or distance(best) <= max_monthly_distance:
+            return best
+    return min(expirations, key=distance)
 
 
 def pick_put_strike(expiration, underlying_mid):
@@ -526,9 +600,10 @@ def select_skew_strikes(strikes, spot, t, r, q, sigma_seed, per_side=SKEW_STRIKE
     return sides["call"], sides["put"]
 
 
-def _solve_side(is_call, entries, quotes, s, t, r, q):
+def _solve_side(is_call, entries, quotes, s, t, r, q, multiplier=EQUITY_MULTIPLIER):
     """Inverts each quoted strike to an implied vol. Returns [(x, iv)] where x is
     d1 for calls and -d1 for puts, so both sides share one target coordinate."""
+    scale = EQUITY_MULTIPLIER / multiplier
     points = []
     for strike, symbol in entries:
         item = quotes.get(symbol)
@@ -538,13 +613,13 @@ def _solve_side(is_call, entries, quotes, s, t, r, q):
         if two_sided is None:
             continue
         mid, bid, ask = two_sided
-        if mid < MIN_OPTION_MID:
+        if mid < MIN_OPTION_MID * scale:
             continue
-        if (ask - bid) > max(MAX_SPREAD_ABSOLUTE, MAX_SPREAD_RELATIVE * mid):
+        if (ask - bid) > max(MAX_SPREAD_ABSOLUTE * scale, MAX_SPREAD_RELATIVE * mid):
             continue
-        if mid <= european_lower_bound(is_call, s, strike, t, r, q) + 0.01:
+        if mid <= european_lower_bound(is_call, s, strike, t, r, q) + 0.01 * scale:
             continue
-        sigma = implied_vol(is_call, mid, s, strike, t, r, q)
+        sigma = implied_vol(is_call, mid, s, strike, t, r, q, multiplier)
         if sigma is None:
             continue
         d1 = bs_d1(s, strike, t, r, q, sigma)
@@ -589,11 +664,13 @@ def compute_skew(candidate, quotes, spot):
         return None, msgs
     t = candidate["skew_t"]
     r = candidate["risk_free_rate"]
-    q = DIVIDEND_YIELD
+    q = candidate["skew_q"]
 
     ivs = {}
     for side, is_call, entries in (("call", True, calls), ("put", False, puts)):
-        points = _solve_side(is_call, entries, quotes, spot, t, r, q)
+        points = _solve_side(
+            is_call, entries, quotes, spot, t, r, q, candidate["multiplier"]
+        )
         iv = interpolate_iv_at_delta(points, q, t)
         if iv is None:
             # |delta| = exp(-qt) * N(x) on both sides, by construction of x.
@@ -613,31 +690,65 @@ def compute_skew(candidate, quotes, spot):
     return (ivs["call"] - ivs["put"]) / total, msgs
 
 
+def _fetch_expirations(ticker):
+    """Returns the chain's expirations. A futures chain spans every contract month,
+    so each of its expirations names its own underlying contract (/ESZ6)."""
+    if is_future(ticker):
+        resp = get(f"/futures-option-chains/{ticker[1:]}/nested")
+        return [e for chain in resp["data"]["option-chains"] for e in chain["expirations"]]
+    items = get(f"/option-chains/{ticker}/nested")["data"]["items"]
+    return items[0]["expirations"] if items else []
+
+
+def _contract_multiplier(expiration, future):
+    """Dollars per point of option price. The futures chain gives no multiplier
+    directly, but notional-value is quoted per display-factor price unit: /ES
+    0.5 / 0.01 = 50, /CL 10 / 0.01 = 1000, /ZN 1000 / 1 = 1000."""
+    if not future:
+        return EQUITY_MULTIPLIER
+    return float(expiration["notional-value"]) / float(expiration["display-factor"])
+
+
 def _build_candidate(ticker, underlying_mid, underlying_by_ticker, metrics_by_ticker, rate):
     """Fetch one ticker's chain and pick its put. Returns (candidate or None, messages);
     messages are returned rather than printed so concurrent workers don't interleave
-    their stderr output."""
+    their stderr output. underlying_mid is None for futures, whose underlying
+    contract is only known once the expiration is picked."""
     msgs = [f"Fetching option chain for {ticker}..."]
+    future = is_future(ticker)
     try:
-        resp = get(f"/option-chains/{ticker}/nested")
+        expirations = _fetch_expirations(ticker)
     except requests.HTTPError:
         msgs.append(f"  {ticker}: option chain fetch failed, skipping")
         return None, msgs
-    items = resp["data"]["items"]
-    if not items or not items[0]["expirations"]:
+    if not expirations:
         msgs.append(f"  {ticker}: no expirations found, skipping")
         return None, msgs
-    expirations = items[0]["expirations"]
-    if not any(e["expiration-type"] == "Weekly" for e in expirations):
+    # Weeklies are an equity liquidity screen. Plenty of liquid futures products
+    # (/ZS, /6E, /NG) list none, so futures rely on the liquidity rating alone.
+    if not future and not any(e["expiration-type"] == "Weekly" for e in expirations):
         msgs.append(f"  {ticker}: no weekly options, skipping")
         return None, msgs
-    expiration = pick_expiration(expirations)
+    if future:
+        expiration = pick_expiration(
+            expirations, FUTURES_MONTHLY_TYPES, MAX_FUTURES_MONTHLY_DISTANCE
+        )
+    else:
+        expiration = pick_expiration(expirations)
+    underlying_symbol = expiration["underlying-symbol"] if future else ticker
+    underlying = underlying_by_ticker.get(ticker, {})
+    if future:
+        mids, underlying_by_contract = fetch_underlying_mids({underlying_symbol})
+        underlying_mid = mids.get(underlying_symbol)
+        underlying = underlying_by_contract.get(underlying_symbol, {})
+        if underlying_mid is None:
+            msgs.append(f"  {ticker}: no underlying quote for {underlying_symbol}, skipping")
+            return None, msgs
     strike = pick_put_strike(expiration, underlying_mid)
     if strike is None:
         msgs.append(f"  {ticker}: no OTM put strike found, skipping")
         return None, msgs
     strike_price = float(strike["strike-price"])
-    underlying = underlying_by_ticker.get(ticker, {})
     metrics = metrics_by_ticker.get(ticker, {})
     year_range = underlying.get("year_range")
     strike_52wk_position = (
@@ -645,6 +756,12 @@ def _build_candidate(ticker, underlying_mid, underlying_by_ticker, metrics_by_ti
     )
     candidate = {
         "ticker": ticker,
+        "underlying_symbol": underlying_symbol,
+        "underlying_mid": underlying_mid,
+        "multiplier": _contract_multiplier(expiration, future),
+        "option_instrument_type": "Future Option" if future else "Equity Option",
+        # Equities keep rounding to a nickel; futures tick sizes vary by product.
+        "tick_sizes": expiration.get("tick-sizes") if future else None,
         "ivr": metrics.get("ivr"),
         "ivx": metrics.get("ivx"),
         "expiration": expiration["expiration-date"],
@@ -672,7 +789,8 @@ def _attach_skew_strikes(candidate, expiration, spot, metrics, rate, msgs):
         return
     # Calendar time, matching the ACT/365 convention behind the ivx column.
     t = max(candidate["dte"], 1) / 365.0
-    q = DIVIDEND_YIELD
+    # q = r makes the forward the futures price itself (Black-76).
+    q = rate if is_future(ticker) else DIVIDEND_YIELD
     calls, puts = select_skew_strikes(expiration["strikes"], spot, t, rate, q, seed)
     if not calls or not puts:
         msgs.append(f"  {ticker}: too few strikes near 25 delta, skipping skew")
@@ -680,13 +798,15 @@ def _attach_skew_strikes(candidate, expiration, spot, metrics, rate, msgs):
     candidate["skew_calls"] = calls
     candidate["skew_puts"] = puts
     candidate["skew_t"] = t
+    candidate["skew_q"] = q
     candidate["skew_seed"] = seed
 
 
 def find_candidates(tickers, underlying_mids, underlying_by_ticker, metrics_by_ticker, rate):
     quoted = []
     for ticker in sorted(tickers):
-        if underlying_mids.get(ticker) is None:
+        # Futures fetch their own contract's quote once the expiration is picked.
+        if not is_future(ticker) and underlying_mids.get(ticker) is None:
             print(f"  {ticker}: no underlying quote, skipping", file=sys.stderr)
             continue
         quoted.append(ticker)
@@ -697,7 +817,7 @@ def find_candidates(tickers, underlying_mids, underlying_by_ticker, metrics_by_t
         # in the same ticker order the serial version produced.
         results = pool.map(
             lambda t: _build_candidate(
-                t, underlying_mids[t], underlying_by_ticker, metrics_by_ticker, rate
+                t, underlying_mids.get(t), underlying_by_ticker, metrics_by_ticker, rate
             ),
             quoted,
         )
@@ -713,16 +833,30 @@ def round_to_nickel(price):
     return round(price / 0.05) * 0.05
 
 
-def dry_run_order(account_number, put_symbol, price):
+def format_limit_price(price, tick_sizes=None):
+    """Rounds to the nearest valid tick. tick_sizes is a chain expiration's
+    tick-sizes list: each entry applies below its threshold, and the last one,
+    with no threshold, applies above them all. None means an equity option."""
+    if not tick_sizes:
+        return f"{round_to_nickel(price):.2f}"
+    tick = next(
+        t["value"] for t in tick_sizes
+        if "threshold" not in t or price < float(t["threshold"])
+    )
+    decimals = len(tick.split(".")[1].rstrip("0")) if "." in tick else 0
+    return f"{round(price / float(tick)) * float(tick):.{max(decimals, 2)}f}"
+
+
+def dry_run_order(account_number, candidate, price):
     body = {
         "order-type": "Limit",
-        "price": f"{round_to_nickel(price):.2f}",
+        "price": format_limit_price(price, candidate["tick_sizes"]),
         "price-effect": "Credit",
         "time-in-force": "Day",
         "legs": [
             {
-                "instrument-type": "Equity Option",
-                "symbol": put_symbol,
+                "instrument-type": candidate["option_instrument_type"],
+                "symbol": candidate["put_symbol"],
                 "quantity": "1",
                 "action": "Sell to Open",
             }
@@ -731,7 +865,7 @@ def dry_run_order(account_number, put_symbol, price):
     return post_dry_run(f"/accounts/{account_number}/orders/dry-run", body)
 
 
-def extract_marginal_buying_power(resp, msgs, ticker=None, debug=False, bpr_mode=DEFAULT_BPR_MODE):
+def extract_marginal_buying_power(resp, msgs, ticker=None, debug=False, key=BPR_MODES[DEFAULT_BPR_MODE]):
     bpe = resp.get("data", {}).get("buying-power-effect", {})
     errors = resp.get("error", {}).get("errors", [])
 
@@ -745,7 +879,6 @@ def extract_marginal_buying_power(resp, msgs, ticker=None, debug=False, bpr_mode
         msgs.append(f"  {ticker}: preflight error: {hard_errors}")
         return None
 
-    key = BPR_MODES[bpr_mode]
     amount = _float_or_none(bpe.get(key))
     if amount is None:
         return None
@@ -764,27 +897,28 @@ def evaluate_candidate(account_number, candidate, credit_mid, debug=False, bpr_m
     left blank, and when it yields <= 0, bpr is shown but the ratios built
     on it are left blank."""
     ticker = candidate["ticker"]
+    key = bpr_key(bpr_mode, is_future(ticker))
     msgs = [f"Dry-running {ticker} {candidate['put_symbol']}..."]
     try:
-        resp = dry_run_order(account_number, candidate["put_symbol"], credit_mid)
+        resp = dry_run_order(account_number, candidate, credit_mid)
     except requests.HTTPError:
         msgs.append(f"  {ticker}: dry-run failed, leaving buying power blank")
         marginal_bp = None
     else:
         marginal_bp = extract_marginal_buying_power(
-            resp, msgs, ticker=ticker, debug=debug, bpr_mode=bpr_mode
+            resp, msgs, ticker=ticker, debug=debug, key=key
         )
     if marginal_bp is None:
-        msgs.append(f"  {ticker}: no {BPR_MODES[bpr_mode]}, leaving buying power blank")
+        msgs.append(f"  {ticker}: no {key}, leaving buying power blank")
     elif marginal_bp <= 0:
         msgs.append(
-            f"  {ticker}: {BPR_MODES[bpr_mode]} {marginal_bp:.2f} <= 0, "
+            f"  {ticker}: {key} {marginal_bp:.2f} <= 0, "
             f"leaving cr/bpr and bpr/ntl blank"
         )
     # Only a positive buying power makes a meaningful denominator.
     ranked = marginal_bp is not None and marginal_bp > 0
-    credit = credit_mid * 100
-    notional = candidate["strike"] * 100
+    credit = credit_mid * candidate["multiplier"]
+    notional = candidate["strike"] * candidate["multiplier"]
     row = {
         "ticker": ticker,
         "ivr": f"{candidate['ivr'] * 100:.1f}" if candidate["ivr"] is not None else "",
@@ -1000,7 +1134,9 @@ if __name__ == "__main__":
     print(f"{len(tickers)} tickers remain after liquidity filter: {sorted(tickers)}", file=sys.stderr)
 
     rate = fetch_risk_free_rate()
-    underlying_mids, underlying_by_ticker = fetch_equity_mids(tickers)
+    underlying_mids, underlying_by_ticker = fetch_underlying_mids(
+        {t for t in tickers if not is_future(t)}
+    )
     candidates = find_candidates(
         tickers, underlying_mids, underlying_by_ticker, metrics_by_ticker, rate
     )
@@ -1016,7 +1152,7 @@ if __name__ == "__main__":
     # The mids fetched above are stale by roughly one full chain-fetch phase, and a
     # wrong spot moves call and put IV in opposite directions, landing straight on
     # the skew. Two requests buys a spot contemporaneous with the option quotes.
-    skew_spots, _ = fetch_equity_mids({c["ticker"] for c in candidates})
+    skew_spots, _ = fetch_underlying_mids({c["underlying_symbol"] for c in candidates})
 
     debug = ARGS.debug
     pending = []
@@ -1026,7 +1162,7 @@ if __name__ == "__main__":
         if credit_mid is None:
             print(f"  {c['ticker']}: no option quote, skipping", file=sys.stderr)
             continue
-        spot = skew_spots.get(c["ticker"]) or underlying_mids.get(c["ticker"])
+        spot = skew_spots.get(c["underlying_symbol"]) or c["underlying_mid"]
         try:
             c["skew"], skew_msgs = compute_skew(c, quotes, spot)
         except Exception as exc:  # never let one ticker's smile kill the scan

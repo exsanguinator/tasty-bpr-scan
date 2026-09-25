@@ -42,12 +42,33 @@ TASTY_ENV=prod python scan-put-bp.py [config-path] [--csv|--html] [--bpr-isolate
 ```
 
 Reads `account_number` and `watchlists` from `margin-scan-config.json` (or the
-config path given as the first argument), resolves the equity tickers across
-those watchlists, filters out `.IVR` symbols, symbols with `liquidity-rating < 2`,
-and symbols without weekly options, then for each remaining ticker picks the
-nearest-to-45-DTE monthly expiration's nearest OTM put strike, dry-runs a
+config path given as the first argument), resolves the equity tickers and
+futures products (e.g. `/ES`) across those watchlists, filters out `.IVR`
+symbols, symbols with `liquidity-rating < 2` (`< 1` for futures; a missing rating, as
+on futures products with no options, always excludes) or no `/market-metrics`
+entry at all, and equities without weekly options, then for each remaining ticker picks
+the nearest-to-45-DTE monthly expiration's nearest OTM put strike, dry-runs a
 1-lot sell-to-open order via `POST /accounts/{account_number}/orders/dry-run`,
 and writes the results ranked by `cr/bpr` (see column definitions below).
+
+**Futures** differ from equities in a few places:
+- The chain comes from `/futures-option-chains/{product}/nested`, which spans
+  every contract month. The underlying is the specific contract the picked
+  expiration settles into (e.g. `/ESZ6` for an `/ES` November option), and
+  its quote supplies the strike's moneyness, `chg%` and the skew's forward.
+- "Monthly" means a `Regular` or `End-Of-Month` expiration: `/ES` lists its
+  monthlies (EW) as End-Of-Month, with Regular reserved for the quarterlies.
+  If the nearest monthly is more than 15 days from 45 DTE, the nearest
+  expiration of any type is used instead. Micros such as `/MES` and `/MNQ`
+  list a single near-dated End-Of-Month and a quarterly, so without this they
+  would land on a days-to-expiry monthly while weeklies sit near 45 DTE.
+- The weekly-options screen doesn't apply, since plenty of liquid products
+  (`/ZS`, `/6E`, `/NG`) list no weeklies.
+- `credit` and notional use the contract's own multiplier
+  (`notional-value / display-factor` from the chain: 50 for `/ES`, 1000 for
+  `/CL`) instead of 100, and the limit price is rounded to the chain's tick
+  sizes instead of a nickel.
+- `52wk%` is always blank: futures quotes carry no 52-week range.
 Output is CSV to stdout by default, or `--csv` explicitly; pass `--html` to
 instead write a standalone HTML page with a click-to-sort results table, followed by
 the date and time the page was generated and an `Export to CSV` button that
@@ -62,7 +83,10 @@ Which dry-run figure becomes the `bpr` column is chosen with one of:
 - `--bpr-isolated` (default) — `isolated-order-margin-requirement`: the margin
   this order requires on its own, regardless of the account's existing
   positions. The premium received doesn't reduce it, so `cr/bpr`
-  compares premium against margin.
+  compares premium against margin. Futures options always return this field
+  as `0.0`, so for futures this mode reads `change-in-margin-requirement`
+  instead: still margin gross of the credit, but measured against the
+  account's existing positions.
 - `--bpr-impact` — `change-in-buying-power`: how much the account's buying
   power actually drops (`current-buying-power − new-buying-power`). This
   reflects existing positions and is roughly
@@ -88,7 +112,7 @@ Passing both flags is an error.
   * 100`, using `prev-close` from `/market-data/by-type`. Negative when the
   underlying is down on the day.
 - `credit` — estimated premium received for selling 1 contract, in dollars
-  (`option mid price * 100`).
+  (`option mid price * 100`, or the contract multiplier for futures).
 - `bpr` — the buying power this 1-lot order consumes, from the
   order dry-run: `isolated-order-margin-requirement` by default, or
   `change-in-buying-power` with `--bpr-impact` (see above). Every ticker
@@ -169,6 +193,17 @@ Passing both flags is an error.
   too far from 25 delta is left blank rather than guessed at, with the
   reason on stderr. Treat `skew` as a comparative screening number across
   tickers, not as an absolute value or a substitute for a broker greek.
+
+  Futures options are priced with Black-76, i.e. the same formulas with the
+  dividend yield set to the risk-free rate, so the forward is the futures
+  price itself; the dividend caveat above doesn't apply to them. Checked
+  against the `volatility` field `/market-data/by-type` returns for futures
+  options, this matches to within a few tenths of a vol point on `/ES`,
+  `/CL`, `/ZN` and `/GC`, with calls and puts at the same strike agreeing;
+  treating the future like a non-dividend stock instead split them by 3-4
+  vol points. The quote filters (minimum mid, maximum spread, minimum vega)
+  are scaled by the contract multiplier so they hold the same dollars per
+  contract as on a 100-share equity option.
 
 ## Publishing to Netlify
 
