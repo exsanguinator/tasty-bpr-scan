@@ -973,6 +973,21 @@ HIGHLIGHT_AT_LEAST_COLUMNS = {"ivr": 30.0}
 NONPOSITIVE_RED_COLUMNS = frozenset({"bpr"})
 
 
+# Columns shown with thousands separators and tabular numerals in the HTML table.
+# The CSV output, and the HTML's own CSV export, keep them ungrouped.
+GROUPED_COLUMNS = frozenset({"strike", "credit", "bpr"})
+
+
+def group_thousands(text):
+    """Inserts thousands separators into an already formatted number, leaving
+    its decimals exactly as printed ("12245.0" -> "12,245.0", "0.0063" unchanged)."""
+    sign, digits = ("-", text[1:]) if text.startswith("-") else ("", text)
+    whole, dot, frac = digits.partition(".")
+    if not whole.isdigit():
+        return text
+    return f"{sign}{int(whole):,}{dot}{frac}"
+
+
 def write_csv(rows, out=sys.stdout):
     writer = csv.DictWriter(out, fieldnames=FIELDNAMES)
     writer.writeheader()
@@ -984,8 +999,10 @@ def write_html(rows, out=sys.stdout, generated_at=None):
     generated_label = html.escape(generated_at.strftime("%Y-%m-%d %H:%M:%S %Z"))
     csv_filename = f"scan-put-bp-{generated_at.strftime('%Y%m%d-%H%M%S')}.csv"
 
-    def cell(value):
-        return "" if value == "" else str(value)
+    def cell(name, value):
+        if value == "":
+            return ""
+        return group_thousands(str(value)) if name in GROUPED_COLUMNS else str(value)
 
     def cell_class(name, value):
         """Colour the signed columns by sign, the threshold columns by which
@@ -993,31 +1010,36 @@ def write_html(rows, out=sys.stdout, generated_at=None):
         theirs, and the nonpositive columns red at or below zero; ties and blanks
         stay neutral."""
         if value == "":
-            return ""
+            return None
         if name in SIGNED_COLUMNS:
             change = float(value)
             if change > 0:
-                return ' class="pos"'
+                return "pos"
             if change < 0:
-                return ' class="neg"'
+                return "neg"
         elif name in THRESHOLD_COLUMNS:
             threshold = THRESHOLD_COLUMNS[name]
             if float(value) < threshold:
-                return ' class="neg"'
+                return "neg"
             if float(value) > threshold:
-                return ' class="pos"'
+                return "pos"
         elif name in HIGHLIGHT_AT_LEAST_COLUMNS:
             if float(value) >= HIGHLIGHT_AT_LEAST_COLUMNS[name]:
-                return ' class="pos"'
+                return "pos"
         elif name in NONPOSITIVE_RED_COLUMNS:
             if float(value) <= 0:
-                return ' class="neg"'
-        return ""
+                return "neg"
+        return None
+
+    def td(name, value):
+        classes = [c for c in (cell_class(name, value), name in GROUPED_COLUMNS and "num") if c]
+        attr = f' class="{" ".join(classes)}"' if classes else ""
+        return f"<td{attr}>{cell(name, value)}</td>"
 
     header_cells = "".join(f"<th onclick=\"sortTable({i})\">{name}</th>" for i, name in enumerate(FIELDNAMES))
     body_rows = "\n".join(
         "<tr>"
-        + "".join(f"<td{cell_class(name, row[name])}>{cell(row[name])}</td>" for name in FIELDNAMES)
+        + "".join(td(name, row[name]) for name in FIELDNAMES)
         + "</tr>"
         for row in rows
     )
@@ -1044,6 +1066,8 @@ def write_html(rows, out=sys.stdout, generated_at=None):
   th.asc::after {{ content: " \\25B2"; }}
   th.desc::after {{ content: " \\25BC"; }}
   td.pos {{ color: #5fd894; }}
+  /* Tabular numerals keep the digits of the grouped columns aligned row to row. */
+  td.num {{ font-variant-numeric: tabular-nums; }}
   td.neg {{ color: #ff9a90; }}
   footer {{
     margin-top: 12px; color: #9aa1a9;
@@ -1078,8 +1102,9 @@ function sortTable(colIndex) {{
   sortState[colIndex] = ascending;
 
   rows.sort((a, b) => {{
-    const av = a.cells[colIndex].innerText;
-    const bv = b.cells[colIndex].innerText;
+    // Commas are the grouped columns' thousands separators, not part of the number.
+    const av = a.cells[colIndex].innerText.replace(/,/g, "");
+    const bv = b.cells[colIndex].innerText.replace(/,/g, "");
     const an = parseFloat(av);
     const bn = parseFloat(bv);
     let cmp;
@@ -1103,7 +1128,10 @@ function exportCsv() {{
   const quote = (text) => /[",\\r\\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
   const table = document.getElementById("results");
   const lines = Array.from(table.rows, (row) =>
-    Array.from(row.cells, (cell) => quote(cell.textContent)).join(",")
+    Array.from(row.cells, (cell) =>
+      // Drop the grouped columns' thousands separators, so the file matches --csv.
+      quote(cell.classList.contains("num") ? cell.textContent.replace(/,/g, "") : cell.textContent)
+    ).join(",")
   );
   const blob = new Blob([lines.join("\\r\\n") + "\\r\\n"], {{ type: "text/csv" }});
   const link = document.createElement("a");

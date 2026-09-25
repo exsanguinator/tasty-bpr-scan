@@ -104,7 +104,9 @@ but that needs this Mac serving the bundle.
   production watchlist run of `scan-put-bp.py`, where all 151 rows' `skew` matched to
   the printed decimal.
 - Rows hold raw numbers and are formatted at render time, so table columns sort
-  numerically rather than lexically.
+  numerically rather than lexically. `strike`, `credit` and `bpr` show thousands
+  separators and tabular numerals, as in the HTML output; `npm run scan` prints them
+  ungrouped, like the Python CSV.
 - Cells are colored as in `scan-put-bp.py`'s HTML output (the CSV is plain text):
   `chg%` and `skew` green when positive and red when negative; `52wk%` red below 50
   and green above; `ivr` green at or above 30; `bpr` red at or below zero. Ties and blanks keep

@@ -5,6 +5,7 @@ import {
   COLUMNS,
   DEFAULT_SORT,
   TICKER_COLUMN,
+  displayText,
   sortRows,
   type Column,
   type ColumnKey,
@@ -136,10 +137,11 @@ export function ResultsTable({ rows }: { rows: ScanRow[] }) {
                         style={[
                           styles.text,
                           column.numeric && styles.numeric,
+                          column.grouped && styles.tabular,
                           signStyle(column, item, theme),
                         ]}
                       >
-                        {column.format(item)}
+                        {displayText(column, item)}
                       </Text>
                     </View>
                   ))}
@@ -206,4 +208,6 @@ const createStyles = (theme: Theme) =>
     text: { fontSize: 13, color: theme.text },
     tickerText: { fontSize: 13, fontWeight: "600", color: theme.text },
     numeric: { textAlign: "right" },
+    // Keeps the digits of the grouped columns aligned row to row.
+    tabular: { fontVariant: ["tabular-nums"] },
   });

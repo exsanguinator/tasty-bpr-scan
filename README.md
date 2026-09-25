@@ -72,7 +72,9 @@ and writes the results ranked by `cr/bpr` (see column definitions below).
 Output is CSV to stdout by default, or `--csv` explicitly; pass `--html` to
 instead write a standalone HTML page with a click-to-sort results table, followed by
 the date and time the page was generated and an `Export to CSV` button that
-downloads the table in its current sort order. Pass
+downloads the table in its current sort order. The table shows `strike`,
+`credit` and `bpr` with thousands separators and tabular numerals; the CSV
+output and the page's CSV export keep them ungrouped. Pass
 `--debug` to print each ticker's raw `buying-power-effect` and any preflight
 errors to stderr. Pass `-h`/`--help` for a summary of all arguments and their
 defaults; it works without `TASTY_ENV=prod` and makes no API calls. Unknown or

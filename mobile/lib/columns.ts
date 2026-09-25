@@ -40,6 +40,11 @@ export type Column = {
   threshold?: number;
   /** Render the value green at or above this cutoff, plain otherwise. */
   highlightAtLeast?: number;
+  /**
+   * Show thousands separators and tabular numerals in the table. format() stays
+   * ungrouped, so the CLI's CSV and the cell coloring read the plain number.
+   */
+  grouped?: boolean;
   format: (row: ScanRow) => string;
 };
 
@@ -57,7 +62,14 @@ const twoDecimal = (value: number | null | undefined): string =>
 export const COLUMNS: Column[] = [
   { key: "expiration", label: "expiration", width: 92, numeric: false, format: (r) => r.expiration },
   { key: "dte", label: "dte", width: 46, numeric: true, format: (r) => String(r.dte) },
-  { key: "strike", label: "strike", width: 66, numeric: true, format: (r) => String(r.strike) },
+  {
+    key: "strike",
+    label: "strike",
+    width: 72,
+    numeric: true,
+    grouped: true,
+    format: (r) => String(r.strike),
+  },
   {
     key: "strike52wkPct",
     label: "52wk%",
@@ -74,13 +86,21 @@ export const COLUMNS: Column[] = [
     signed: true,
     format: (r) => twoDecimal(r.chgPct),
   },
-  { key: "credit", label: "credit", width: 66, numeric: true, format: (r) => oneDecimal(r.credit) },
+  {
+    key: "credit",
+    label: "credit",
+    width: 76,
+    numeric: true,
+    grouped: true,
+    format: (r) => oneDecimal(r.credit),
+  },
   {
     key: "buyingPower",
     label: "bpr",
-    width: 78,
+    width: 84,
     numeric: true,
     nonpositiveRed: true,
+    grouped: true,
     format: (r) => oneDecimal(r.buyingPower),
   },
   { key: "creditToBpr", label: "cr/bpr", width: 72, numeric: true, format: (r) => oneDecimal(r.creditToBpr) },
@@ -104,6 +124,24 @@ export const COLUMNS: Column[] = [
     format: (r) => oneDecimal(r.skew),
   },
 ];
+
+/**
+ * Inserts thousands separators into an already formatted number, leaving its
+ * decimals exactly as printed ("12245.0" -> "12,245.0", "0.0063" unchanged).
+ * Matches group_thousands() in scan-put-bp.py.
+ */
+export function groupThousands(text: string): string {
+  const match = /^(-?)(\d+)(\.\d*)?$/.exec(text);
+  if (!match) return text;
+  const [, sign, whole, frac = ""] = match;
+  return sign + whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + frac;
+}
+
+/** The text a table cell shows: format(), grouped for the grouped columns. */
+export function displayText(column: Column, row: ScanRow): string {
+  const text = column.format(row);
+  return column.grouped ? groupThousands(text) : text;
+}
 
 /** The ticker column is pinned outside the horizontal scroller. */
 export const TICKER_COLUMN: Column = {
