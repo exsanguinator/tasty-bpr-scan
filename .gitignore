@@ -16,3 +16,4 @@ mobile/ios/
 
 # sh-*.sh output
 output-*.html
+.DS_Store

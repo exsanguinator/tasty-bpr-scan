@@ -9,3 +9,4 @@ trap 'rm -f "$tmp"' EXIT
 .venv/bin/python3 scan-put-bp.py --html --bpr-isolated margin-scan-config-futures.json > "$tmp"
 mv "$tmp" output-futures.html
 .venv/bin/python3 publish-cloudflare.py output-futures.html --as futures.html
+open output-futures.html
