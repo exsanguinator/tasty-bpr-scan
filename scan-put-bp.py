@@ -278,7 +278,7 @@ def resolve_tickers(watchlist_names):
         for entry in item["watchlist-entries"]:
             kind = entry["instrument-type"]
             symbol = entry["symbol"]
-            if kind == "Equity" and not symbol.endswith(".IVR"):
+            if kind in ["Equity","Index] and not symbol.endswith(".IVR"):
                 tickers.add(symbol)
             elif kind == "Future" and is_future(symbol):
                 tickers.add(symbol)
